@@ -1,0 +1,43 @@
+[package]
+name = "storybox3"
+version = "3.0.0"
+description = "AI-powered photo storytelling app — powered by OpenRouter"
+authors = ["StoryBox Team"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "tauri_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[profile.dev]
+lto = "thin"
+incremental = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-rustls"], default-features = false }
+anyhow = "1.0"
+directories = "5.0"
+walkdir = "2.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+uuid = { version = "1.8.0", features = ["v4"] }
+chrono = "0.4.38"
+tauri-plugin-dialog = "2"
+rand = "0.8.5"
+tauri-plugin-fs = "2"
+base64 = "0.22.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tauri-plugin-medialibrary = "0.14.0"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+tauri-plugin-ios-photos = "0.3"
+

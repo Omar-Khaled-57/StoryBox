@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>StoryBox needs access to your photo library to scan photos and create beautiful AI-powered photo stories.</string>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>StoryBox may save story thumbnails to your photo library.</string>
+</dict>
+</plist>

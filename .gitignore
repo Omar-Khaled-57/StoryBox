@@ -1,0 +1,77 @@
+# =========================
+# Dependencies
+# =========================
+node_modules/
+package-lock.json
+
+# =========================
+# Build outputs (frontend)
+# =========================
+dist/
+output/
+.vite/
+
+# =========================
+# Tauri / Rust build outputs
+# =========================
+src-tauri/target/
+src-tauri/gen/
+src-tauri/.tauri/
+
+# =========================
+# Environment & secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# IMPORTANT: never commit signing keys
+*.jks
+*.keystore
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Logs
+# =========================
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================
+# Supabase local dev (optional)
+# =========================
+supabase/.branches/
+supabase/.temp/
+supabase/logs/
+supabase/.env.local
+
+# =========================
+# Vite / TS cache
+# =========================
+*.tsbuildinfo
+
+# =========================
+# Tauri debug / release artifacts
+# =========================
+*.apk
+*.aab
+*.dmg
+*.msi
+*.AppImage
+
+# =========================
+# Optional dev folders (your project)
+# =========================
+dev/
