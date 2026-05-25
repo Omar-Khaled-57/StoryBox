@@ -39,7 +39,7 @@
 
 ```bash
 # Clone the repo
-git clone https://github.com/Omar-Khaled-57/StoryBox3.git
+git clone https://github.com/Omar-Khaled-57/StoryBox.git
 cd StoryBox3
 
 # Install JS dependencies
