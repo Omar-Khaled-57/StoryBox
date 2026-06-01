@@ -1,6 +1,6 @@
 [package]
 name = "storybox3"
-version = "3.0.0"
+version = "3.0.1"
 description = "AI-powered photo storytelling app — powered by OpenRouter"
 authors = ["StoryBox Team"]
 edition = "2021"

@@ -7,12 +7,220 @@
 /// - iOS/Android: emits events for the frontend to push photo data
 use crate::processor::{IndexingJob, ProcessingState};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use sqlx::{Pool, Sqlite};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc::Sender;
 use walkdir::WalkDir;
 use directories::UserDirs;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ScannedFolder {
+    pub id: String,
+    pub path: String,
+    pub is_enabled: bool,
+    pub added_at: String,
+}
+
+pub async fn get_enabled_folders(pool: &Pool<Sqlite>) -> Vec<ScannedFolder> {
+    sqlx::query_as::<_, (String, String, bool, String)>(
+        "SELECT id, path, is_enabled, COALESCE(added_at, '') FROM scanned_folders WHERE is_enabled = 1 ORDER BY added_at DESC"
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(id, path, is_enabled, added_at)| ScannedFolder { id, path, is_enabled, added_at })
+    .collect()
+}
+
+pub async fn get_all_folders(pool: &Pool<Sqlite>) -> Vec<ScannedFolder> {
+    sqlx::query_as::<_, (String, String, bool, String)>(
+        "SELECT id, path, is_enabled, COALESCE(added_at, '') FROM scanned_folders ORDER BY added_at DESC"
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(id, path, is_enabled, added_at)| ScannedFolder { id, path, is_enabled, added_at })
+    .collect()
+}
+
+pub async fn scan_persisted_folders(
+    pool: &Pool<Sqlite>,
+    tx: &Sender<IndexingJob>,
+    proc_state: Arc<ProcessingState>,
+) -> Result<usize, String> {
+    let folders = get_enabled_folders(pool).await;
+    let mut total_count = 0;
+    for folder in &folders {
+        let path = PathBuf::from(&folder.path);
+        if path.exists() {
+            match scan_directory(&path, tx, proc_state.clone()).await {
+                Ok(c) => total_count += c,
+                Err(e) => eprintln!("Error scanning {:?}: {}", path, e),
+            }
+        }
+    }
+    Ok(total_count)
+}
+
+#[tauri::command]
+pub async fn get_scanned_folders(pool: tauri::State<'_, Pool<Sqlite>>) -> Result<Vec<ScannedFolder>, String> {
+    Ok(get_all_folders(&pool).await)
+}
+
+#[tauri::command]
+pub async fn add_scanned_folder(
+    path: String,
+    pool: tauri::State<'_, Pool<Sqlite>>,
+) -> Result<ScannedFolder, String> {
+    use uuid::Uuid;
+    let id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO scanned_folders (id, path, is_enabled) VALUES (?, ?, 1)")
+        .bind(&id)
+        .bind(&path)
+        .execute(&*pool)
+        .await
+        .map_err(|e| format!("Failed to add folder: {}. Possibly a duplicate.", e))?;
+    let row = sqlx::query_as::<_, (String, String, bool, String)>(
+        "SELECT id, path, is_enabled, COALESCE(added_at, '') FROM scanned_folders WHERE id = ?"
+    )
+    .bind(&id)
+    .fetch_one(&*pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(ScannedFolder { id: row.0, path: row.1, is_enabled: row.2, added_at: row.3 })
+}
+
+#[tauri::command]
+pub async fn remove_scanned_folder(id: String, pool: tauri::State<'_, Pool<Sqlite>>) -> Result<(), String> {
+    sqlx::query("DELETE FROM scanned_folders WHERE id = ?")
+        .bind(&id)
+        .execute(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn toggle_scanned_folder(id: String, pool: tauri::State<'_, Pool<Sqlite>>) -> Result<ScannedFolder, String> {
+    sqlx::query("UPDATE scanned_folders SET is_enabled = CASE WHEN is_enabled = 1 THEN 0 ELSE 1 END WHERE id = ?")
+        .bind(&id)
+        .execute(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let row = sqlx::query_as::<_, (String, String, bool, String)>(
+        "SELECT id, path, is_enabled, COALESCE(added_at, '') FROM scanned_folders WHERE id = ?"
+    )
+    .bind(&id)
+    .fetch_one(&*pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(ScannedFolder { id: row.0, path: row.1, is_enabled: row.2, added_at: row.3 })
+}
+
+#[tauri::command]
+pub async fn check_folders_accessibility(pool: tauri::State<'_, Pool<Sqlite>>) -> Result<Vec<serde_json::Value>, String> {
+    let folders = get_all_folders(&pool).await;
+    let mut results = Vec::new();
+    for folder in &folders {
+        let accessible = Path::new(&folder.path).exists();
+        results.push(serde_json::json!({
+            "id": folder.id,
+            "path": folder.path,
+            "accessible": accessible,
+            "is_enabled": folder.is_enabled
+        }));
+    }
+    Ok(results)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FolderChild {
+    pub name: String,
+    pub path: String,
+    pub disabled: bool,
+}
+
+#[tauri::command]
+pub async fn get_folder_children(
+    path: String,
+    pool: tauri::State<'_, Pool<Sqlite>>,
+) -> Result<Vec<FolderChild>, String> {
+    // Load disabled overrides for this parent
+    let disabled_children: Vec<String> = sqlx::query_scalar(
+        "SELECT child_name FROM folder_child_overrides WHERE parent_path = ? AND is_disabled = 1"
+    )
+    .bind(&path)
+    .fetch_all(&*pool)
+    .await
+    .unwrap_or_default();
+
+    let dir = PathBuf::from(&path);
+    if !dir.exists() || !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut children = Vec::new();
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("Failed to read directory: {}", e))?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if let Some(name) = entry.file_name().to_str() {
+                let child_path = entry.path().to_string_lossy().to_string();
+                let disabled = disabled_children.contains(&name.to_string());
+                children.push(FolderChild { name: name.to_string(), path: child_path, disabled });
+            }
+        }
+    }
+    children.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(children)
+}
+
+#[tauri::command]
+pub async fn toggle_child_override(
+    parent_path: String,
+    child_name: String,
+    pool: tauri::State<'_, Pool<Sqlite>>,
+) -> Result<bool, String> {
+    // Check if an override exists
+    let existing: Option<(bool,)> = sqlx::query_as(
+        "SELECT is_disabled FROM folder_child_overrides WHERE parent_path = ? AND child_name = ?"
+    )
+    .bind(&parent_path)
+    .bind(&child_name)
+    .fetch_optional(&*pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    match existing {
+        Some((disabled,)) => {
+            // Toggle: if currently disabled, remove override (re-enable); if not disabled, insert (shouldn't happen)
+            if disabled {
+                sqlx::query("DELETE FROM folder_child_overrides WHERE parent_path = ? AND child_name = ?")
+                    .bind(&parent_path)
+                    .bind(&child_name)
+                    .execute(&*pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(false) // no longer disabled
+            } else {
+                Ok(false)
+            }
+        }
+        None => {
+            // Insert new override (disabled)
+            sqlx::query("INSERT INTO folder_child_overrides (parent_path, child_name, is_disabled) VALUES (?, ?, 1)")
+                .bind(&parent_path)
+                .bind(&child_name)
+                .execute(&*pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(true) // now disabled
+        }
+    }
+}
 
 pub async fn scan_directory(dir: &Path, tx: &Sender<IndexingJob>, state: Arc<ProcessingState>) -> Result<usize> {
     // We do a simple blocking walkdir inside a spawned blocking thread.
@@ -70,15 +278,17 @@ pub async fn start_scan(
 pub async fn start_scan_device(
     state: tauri::State<'_, Sender<IndexingJob>>, 
     proc_state: tauri::State<'_, Arc<ProcessingState>>,
-    handle: tauri::AppHandle
+    handle: tauri::AppHandle,
+    pool: tauri::State<'_, Pool<Sqlite>>,
 ) -> Result<usize, String> {
-    internal_scan_device(&*state, proc_state.inner().clone(), &handle).await
+    internal_scan_device(&*state, proc_state.inner().clone(), &handle, Some(&pool)).await
 }
 
 pub async fn internal_scan_device(
     tx: &Sender<IndexingJob>, 
     proc_state: Arc<ProcessingState>,
-    handle: &tauri::AppHandle
+    handle: &tauri::AppHandle,
+    pool: Option<&Pool<Sqlite>>,
 ) -> Result<usize, String> {
     use tauri::Emitter;
     let mut total_count = 0;
@@ -153,6 +363,31 @@ pub async fn internal_scan_device(
     search_paths.sort();
     search_paths.dedup();
 
+    // Persist discovered paths to the scanned_folders table so they appear in the UI
+    if let Some(pool) = pool {
+        use uuid::Uuid;
+        for p in &search_paths {
+            let p_str = p.to_string_lossy().to_string();
+            let id = Uuid::new_v4().to_string();
+            let _ = sqlx::query("INSERT OR IGNORE INTO scanned_folders (id, path, is_enabled) VALUES (?, ?, 1)")
+                .bind(&id)
+                .bind(&p_str)
+                .execute(pool)
+                .await;
+        }
+        // Remove any paths the user has explicitly disabled from the scan list
+        let disabled: Vec<String> = sqlx::query_as::<_, (String,)>(
+            "SELECT path FROM scanned_folders WHERE is_enabled = 0"
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(p,)| p)
+        .collect();
+        search_paths.retain(|p| !disabled.contains(&p.to_string_lossy().to_string()));
+    }
+
     for p in search_paths {
         if p.exists() {
             println!("[Scanner] Auto-scanning: {:?}", p);
@@ -160,6 +395,14 @@ pub async fn internal_scan_device(
                 Ok(c) => total_count += c,
                 Err(e) => eprintln!("Error scanning {:?}: {}", p, e),
             }
+        }
+    }
+
+    // Also scan persisted enabled folders from the database
+    if let Some(pool) = pool {
+        match scan_persisted_folders(pool, tx, proc_state.clone()).await {
+            Ok(c) => total_count += c,
+            Err(e) => eprintln!("Error scanning persisted folders: {}", e),
         }
     }
 

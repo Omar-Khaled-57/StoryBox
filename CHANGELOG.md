@@ -4,6 +4,43 @@ A running log of every change, fix, and decision during development. Newest entr
 
 ---
 
+## v3.0.1 — Scanned Folders Management · 2025-06-01
+
+**Focus**: Add persistent Scanned Folder management with subfolder toggle hierarchy.
+
+### 🚀 New
+
+- **Scanned Folders in Settings** — add/remove folders, toggle enable/disable per folder, see subfolder counts with expand/collapse.
+- **Subfolder toggle overrides** — individual subfolders can be disabled while the parent stays enabled; state stored via `folder_child_overrides` table.
+- **Auto-persist default paths** — discovered Pictures/OneDrive paths are saved to `scanned_folders` on startup; no need to re-add them manually.
+- **Folder accessibility check** — missing folders show a red "Missing" badge and an amber warning banner at the top of the list.
+
+### 🔧 Backend
+
+- **`folder_child_overrides` table** (SQLite) — `(parent_path, child_name, is_disabled)` with composite primary key.
+- **New IPC commands** — `toggle_child_override`, `get_folder_children` now returns `disabled: bool` per child.
+- **Image filtering** — both `generate_random_story` and `generate_ai_story` exclude images from disabled folders (parent & subfolder overrides).
+- **`internal_scan_device`** — skips disabled folders during auto-scan; persists discovered default paths.
+
+### 🎨 Frontend
+
+- **`ScannedFoldersSection`** — scrollable list in Settings with Add Folder / Re-scan buttons.
+- **`FolderRow`** — expandable rows with toggle switch (`w-10 h-6`, symmetrical 4px gaps) and nested child toggle list.
+- **Optimistic child toggle** — subfolder state flips instantly in UI then syncs to backend.
+
+### 🧹 Changes
+
+| File | What changed |
+|------|-------------|
+| `src-tauri/src/db.rs` | Added `folder_child_overrides` table |
+| `src-tauri/src/scanner.rs` | Added `toggle_child_override`, updated `get_folder_children` with `disabled` field |
+| `src-tauri/src/stories.rs` | Both generators exclude overridden child folder images |
+| `src-tauri/src/lib.rs` | Registered `toggle_child_override` command |
+| `src/App.tsx` | `handleToggleChildFolder` uses override pattern |
+| `src/components/SettingsPanel.tsx` | Rewrote `FolderRow` with local optimistic state; removed `allFolders` prop |
+
+---
+
 ## v3.0.2 — Polish, Prompts & Build Fix · 2025-05-25
 
 **Focus**: Improve AI prompt quality, fix build errors, and polish the UI.

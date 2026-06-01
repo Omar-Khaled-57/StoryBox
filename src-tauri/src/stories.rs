@@ -118,9 +118,23 @@ fn build_caption(all_tags: &[String], vibe: Option<&str>, color_vibe: Option<&st
 
 /// Generate a random story from unfiltered images in the DB.
 pub async fn generate_random_story(pool: &Pool<Sqlite>) -> Result<Option<Story>> {
-    // Pick up to 8 random images
+    // Pick up to 8 random images, excluding any from disabled folders or overridden child folders
     let images: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
-        "SELECT id, path, date_taken, ai_analyzed FROM images ORDER BY RANDOM() LIMIT 8",
+        "SELECT id, path, date_taken, ai_analyzed FROM images
+         WHERE NOT EXISTS (
+             SELECT 1 FROM scanned_folders sf
+             WHERE sf.is_enabled = 0
+             AND (images.path = sf.path OR images.path LIKE sf.path || '/' || '%' OR images.path LIKE sf.path || '\\' || '%')
+         )
+         AND NOT EXISTS (
+             SELECT 1 FROM folder_child_overrides fco
+             WHERE fco.is_disabled = 1
+             AND (images.path = fco.parent_path || '/' || fco.child_name
+                  OR images.path LIKE fco.parent_path || '/' || fco.child_name || '/' || '%'
+                  OR images.path = fco.parent_path || '\\' || fco.child_name
+                  OR images.path LIKE fco.parent_path || '\\' || fco.child_name || '\\' || '%')
+         )
+         ORDER BY RANDOM() LIMIT 8",
     )
     .fetch_all(pool)
     .await?;
@@ -204,9 +218,23 @@ fn parse_tags(tags_json: Option<String>) -> Vec<String> {
 
 /// Generate a story based on AI analysis or date clusters
 pub async fn generate_ai_story(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> Result<Option<Story>> {
-    // 1. Fetch analyzed images
+    // 1. Fetch analyzed images, excluding any from disabled folders or overridden child folders
     let features: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT f.image_id, i.path, i.date_taken, f.tags, f.dominant_color FROM image_features f JOIN images i ON f.image_id = i.id"
+        "SELECT f.image_id, i.path, i.date_taken, f.tags, f.dominant_color FROM image_features f
+         JOIN images i ON f.image_id = i.id
+         WHERE NOT EXISTS (
+             SELECT 1 FROM scanned_folders sf
+             WHERE sf.is_enabled = 0
+             AND (i.path = sf.path OR i.path LIKE sf.path || '/' || '%' OR i.path LIKE sf.path || '\\' || '%')
+         )
+         AND NOT EXISTS (
+             SELECT 1 FROM folder_child_overrides fco
+             WHERE fco.is_disabled = 1
+             AND (i.path = fco.parent_path || '/' || fco.child_name
+                  OR i.path LIKE fco.parent_path || '/' || fco.child_name || '/' || '%'
+                  OR i.path = fco.parent_path || '\\' || fco.child_name
+                  OR i.path LIKE fco.parent_path || '\\' || fco.child_name || '\\' || '%')
+         )"
     )
     .fetch_all(pool)
     .await?;

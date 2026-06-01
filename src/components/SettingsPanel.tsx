@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { AiStatus, AiHealthStatus } from "../App";
+import { AiStatus, AiHealthStatus, ScannedFolder } from "../App";
 import Logo from "./Logo";
 
 interface SettingsPanelProps {
@@ -12,10 +12,19 @@ interface SettingsPanelProps {
   setAiHealth: (health: AiHealthStatus | null) => void;
   initialSection?: string | null;
   onInitialSectionHandled?: () => void;
+  scannedFolders: ScannedFolder[];
+  folderAccessibility: Map<string, boolean>;
+  onAddScannedFolder: () => void;
+  onRemoveScannedFolder: (id: string) => void;
+  onToggleScannedFolder: (id: string) => void;
+  onReScanFolders: () => void;
+  onToggleChildFolder: (parentPath: string, childName: string) => void;
 }
 
 export default function SettingsPanel({
-  scanLog, isScanning, onScan, onScanDevice, aiHealth, setAiHealth, initialSection, onInitialSectionHandled
+  scanLog, isScanning, onScan, onScanDevice, aiHealth, setAiHealth, initialSection, onInitialSectionHandled,
+  scannedFolders, folderAccessibility, onAddScannedFolder, onRemoveScannedFolder, onToggleScannedFolder, onReScanFolders,
+  onToggleChildFolder
 }: SettingsPanelProps) {
   const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(true);
@@ -109,6 +118,19 @@ export default function SettingsPanel({
               </button>
             )}
           </div>
+        </Section>
+
+        <Section icon={<FolderTreeIcon />} title="Scanned Folders" description="Manage which folders StoryBox3 is allowed to scan for photos.">
+          <ScannedFoldersSection
+            folders={scannedFolders}
+            accessibility={folderAccessibility}
+            isScanning={isScanning}
+            onAdd={onAddScannedFolder}
+            onRemove={onRemoveScannedFolder}
+            onToggle={onToggleScannedFolder}
+            onReScan={onReScanFolders}
+            onToggleChild={onToggleChildFolder}
+          />
         </Section>
 
         <Section icon={<BrainIcon />} title="AI Storyteller" description="Configure OpenRouter, Ollama, or Mock mode for story generation.">
@@ -292,6 +314,186 @@ export default function SettingsPanel({
           <span className="text-[9px] text-surface-600 tracking-widest uppercase">Popcorn</span>
         </footer>
       </div>
+    </div>
+  );
+}
+
+// ── Scanned Folders Section ──
+function ScannedFoldersSection({ folders, accessibility, isScanning, onAdd, onRemove, onToggle, onReScan, onToggleChild }: {
+  folders: ScannedFolder[];
+  accessibility: Map<string, boolean>;
+  isScanning: boolean;
+  onAdd: () => void;
+  onRemove: (id: string) => void;
+  onToggle: (id: string) => void;
+  onReScan: () => void;
+  onToggleChild: (parentPath: string, childName: string) => void;
+}) {
+  const inaccessibleCount = folders.filter(f => accessibility.get(f.id) === false).length;
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center gap-2">
+        <button className="btn-primary flex items-center justify-center gap-2 px-5 py-3 font-bold text-xs uppercase tracking-widest disabled:opacity-50 flex-1" onClick={onAdd} disabled={isScanning}>
+          <FolderPlusIcon /><span>Add Folder</span>
+        </button>
+        <button className="btn-secondary flex items-center justify-center gap-2 px-4 py-3 font-bold text-xs uppercase tracking-widest disabled:opacity-50" onClick={onReScan} disabled={isScanning}>
+          <RefreshIcon /><span>Re-scan</span>
+        </button>
+      </div>
+
+      {inaccessibleCount > 0 && (
+        <div className="flex items-center gap-2.5 px-4 py-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs font-medium">
+          <InfoIcon />{inaccessibleCount} folder(s) are no longer accessible. Remove or update their paths.
+        </div>
+      )}
+
+      <div className="flex flex-col gap-1.5 max-h-80 overflow-y-auto pr-1 scroll-smooth">
+        {folders.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-6 gap-2 bg-surface-900/30 rounded-xl border border-dashed border-neon-500/10">
+            <span className="text-surface-500 text-xs font-medium">No folders configured yet.</span>
+            <span className="text-surface-600 text-[10px]">Click "Add Folder" to get started.</span>
+          </div>
+        ) : (
+          folders.map(f => {
+            const accessible = accessibility.get(f.id);
+            const isMissing = accessible === false;
+            return (
+              <FolderRow
+                key={f.id}
+                folder={f}
+                isMissing={isMissing}
+                onToggle={onToggle}
+                onRemove={onRemove}
+                onToggleChild={onToggleChild}
+              />
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FolderRow({ folder, isMissing, onToggle, onRemove, onToggleChild }: {
+  folder: ScannedFolder;
+  isMissing: boolean;
+  onToggle: (id: string) => void;
+  onRemove: (id: string) => void;
+  onToggleChild: (parentPath: string, childName: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [children, setChildren] = useState<{ name: string; path: string; disabled: boolean }[] | null>(null);
+  const [loadingChildren, setLoadingChildren] = useState(false);
+
+  const loadChildren = useCallback(async () => {
+    if (children !== null || isMissing) return;
+    setLoadingChildren(true);
+    try {
+      const result = await invoke<{ name: string; path: string; disabled: boolean }[]>("get_folder_children", { path: folder.path });
+      setChildren(result);
+    } catch { setChildren([]); }
+    finally { setLoadingChildren(false); }
+  }, [folder.path, children, isMissing]);
+
+  const handleToggle = () => {
+    const next = !expanded;
+    setExpanded(next);
+    if (next) loadChildren();
+  };
+
+  const handleChildToggle = (childName: string) => {
+    // Optimistic update — flip disabled state locally, then sync to backend
+    setChildren(prev => prev?.map(c =>
+      c.name === childName ? { ...c, disabled: !c.disabled } : c
+    ) ?? prev);
+    onToggleChild(folder.path, childName);
+  };
+
+  return (
+    <div className="flex flex-col">
+      <div className={`flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl border transition-all duration-200 ${
+        isMissing
+          ? "bg-red-900/20 border-red-500/20"
+          : folder.is_enabled
+            ? "bg-surface-900/60 border-neon-500/10"
+            : "bg-surface-900/30 border-surface-700/30 opacity-60"
+      }`}>
+        <button
+          onClick={handleToggle}
+          className={`shrink-0 w-4 h-4 flex items-center justify-center text-surface-500 hover:text-surface-300 transition-colors ${!isMissing ? "" : "invisible"}`}
+          title={expanded ? "Collapse" : "Expand"}
+        >
+          {loadingChildren ? (
+            <span className="w-2.5 h-2.5 border-2 border-surface-600 border-t-current rounded-full animate-spin" />
+          ) : (
+            <svg className={`w-3 h-3 transition-transform duration-200 ${expanded ? "rotate-90" : ""}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><polyline points="9 18 15 12 9 6"/></svg>
+          )}
+        </button>
+        <button
+          onClick={() => onToggle(folder.id)}
+          className={`shrink-0 w-10 h-6 rounded-full transition-colors duration-200 p-1 flex items-center ${
+            folder.is_enabled ? (isMissing ? "bg-red-500/40" : "bg-neon-500") : "bg-surface-700"
+          }`}
+          title={folder.is_enabled ? "Enabled" : "Disabled"}
+        >
+          <span className={`w-4 h-4 bg-white rounded-full shadow transition-transform duration-200 ${
+            folder.is_enabled ? "translate-x-4" : "translate-x-0"
+          }`} />
+        </button>
+        <div className="flex-1 min-w-0 flex flex-col gap-0">
+          <span className={`text-xs font-bold truncate ${isMissing ? "text-red-400" : "text-surface-100"}`}
+            title={folder.path}>
+            {folder.path}
+          </span>
+          <div className="flex items-center gap-2">
+            <span className={`text-[9px] font-semibold uppercase tracking-wider ${
+              isMissing ? "text-red-400" : folder.is_enabled ? "text-emerald-400" : "text-surface-500"
+            }`}>
+              {isMissing ? "Missing" : folder.is_enabled ? "Enabled" : "Disabled"}
+            </span>
+            {children !== null && (
+              <span className="text-[9px] text-surface-500">
+                {children.length} subfolder{children.length !== 1 ? "s" : ""}
+              </span>
+            )}
+          </div>
+        </div>
+        <button onClick={() => onRemove(folder.id)}
+          className="shrink-0 p-1.5 rounded-lg text-surface-500 hover:text-red-400 hover:bg-red-500/10 transition-colors active:scale-90"
+          title="Remove folder">
+          <TrashIconSmall />
+        </button>
+      </div>
+      {expanded && children !== null && children.length > 0 && (
+        <div className="flex flex-col ml-5 mt-1 gap-1">
+          {children.map(child => {
+            const childEnabled = !child.disabled && folder.is_enabled;
+            return (
+              <div key={child.path} className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-surface-900/20 border border-neon-500/5">
+                <button
+                  onClick={() => handleChildToggle(child.name)}
+                  className={`shrink-0 w-7 h-4 rounded-full transition-colors duration-200 p-0.5 flex items-center ${
+                    childEnabled ? "bg-neon-500/60" : "bg-surface-700/60"
+                  }`}
+                  title={childEnabled ? "Enabled" : "Disabled"}
+                >
+                  <span className={`w-3 h-3 bg-white rounded-full shadow transition-transform duration-200 ${
+                    childEnabled ? "translate-x-3" : "translate-x-0"
+                  }`} />
+                </button>
+                <svg className="shrink-0 w-3 h-3 text-surface-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                <span className="text-[11px] text-surface-300 truncate flex-1" title={child.path}>{child.name}</span>
+                <span className={`text-[8px] font-semibold uppercase tracking-wider ${
+                  childEnabled ? "text-emerald-400/60" : "text-surface-500/60"
+                }`}>
+                  {childEnabled ? "Enabled" : "Disabled"}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -536,3 +738,6 @@ function ClockIcon() { return <svg viewBox="0 0 24 24" fill="none" stroke="curre
 function BrainIcon() { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-5 h-5"><path d="M12 2a10 10 0 0110 10c0 5-4 8-10 8S2 17 2 12 7 2 12 2z"/><path d="M8 12h8"/><path d="M12 8v8"/></svg>; }
 function TrashIcon() { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="w-5 h-5"><path d="M3 6h18m-2 0v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6m3 0V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>; }
 function ShieldIcon() { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="w-5 h-5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>; }
+function FolderTreeIcon() { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-5 h-5"><path d="M2 4h4l2 3h14v11H2V4z"/><path d="M8 12h4"/><path d="M14 12h2"/><path d="M8 16h8"/></svg>; }
+function RefreshIcon() { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="w-4 h-4"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>; }
+function TrashIconSmall() { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="w-4 h-4"><path d="M3 6h18m-2 0v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6m3 0V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>; }

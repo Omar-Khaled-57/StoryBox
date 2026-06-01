@@ -198,12 +198,13 @@ pub fn run() {
                     proc_state.clone()
                 ));
 
-                // Startup scan
+                // Startup scan — use persisted folders + device defaults
                 let tx_scan = tx.clone();
                 let handle_scan = handle.clone();
                 let proc_state_scan = proc_state.clone();
+                let pool_scan = pool.clone();
                 tokio::spawn(async move {
-                    let _ = scanner::internal_scan_device(&tx_scan, proc_state_scan, &handle_scan).await;
+                    let _ = scanner::internal_scan_device(&tx_scan, proc_state_scan, &handle_scan, Some(&pool_scan)).await;
                 });
 
                 // Onboarding stories
@@ -239,6 +240,13 @@ pub fn run() {
             index_ios_image_data,
             scanner::start_scan,
             scanner::start_scan_device,
+            scanner::get_scanned_folders,
+            scanner::add_scanned_folder,
+            scanner::remove_scanned_folder,
+            scanner::toggle_scanned_folder,
+            scanner::check_folders_accessibility,
+            scanner::get_folder_children,
+            scanner::toggle_child_override,
             stories::generate_story,
             stories::get_stories,
             stories::get_cached_image_base64,

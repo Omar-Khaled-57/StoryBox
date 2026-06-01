@@ -137,5 +137,27 @@ async fn create_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS scanned_folders (
+            id TEXT PRIMARY KEY,
+            path TEXT UNIQUE NOT NULL,
+            is_enabled BOOLEAN DEFAULT 1,
+            added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS folder_child_overrides (
+            parent_path TEXT NOT NULL,
+            child_name TEXT NOT NULL,
+            is_disabled BOOLEAN DEFAULT 1,
+            PRIMARY KEY (parent_path, child_name)
+        );",
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

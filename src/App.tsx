@@ -49,6 +49,13 @@ export interface Story {
   is_pinned: boolean;
 }
 
+export interface ScannedFolder {
+  id: string;
+  path: string;
+  is_enabled: boolean;
+  added_at: string;
+}
+
 type View = "home" | "favorites" | "settings";
 
 let _nextId = 0;
@@ -65,6 +72,8 @@ function App() {
   const [aiHealth, setAiHealth] = useState<AiHealthStatus | null>(null);
   const [settingsInitialSection, setSettingsInitialSection] = useState<string | null>(null);
   const [activities, setActivities] = useState<ActivityItem[]>([]);
+  const [scannedFolders, setScannedFolders] = useState<ScannedFolder[]>([]);
+  const [folderAccessibility, setFolderAccessibility] = useState<Map<string, boolean>>(new Map());
 
   const addActivity = (label: string): string => {
     const id = mkId();
@@ -85,9 +94,28 @@ function App() {
     }
   }, []);
 
+  const loadScannedFolders = useCallback(async () => {
+    try {
+      const folders = await invoke<ScannedFolder[]>("get_scanned_folders");
+      setScannedFolders(folders);
+      const accessResults: any[] = await invoke("check_folders_accessibility");
+      const accessMap = new Map<string, boolean>();
+      for (const r of accessResults) {
+        accessMap.set(r.id, r.accessible);
+      }
+      setFolderAccessibility(accessMap);
+    } catch (e) {
+      console.error("Failed to load scanned folders:", e);
+    }
+  }, []);
+
   useEffect(() => {
     loadStories();
   }, [loadStories]);
+
+  useEffect(() => {
+    loadScannedFolders();
+  }, [loadScannedFolders]);
 
   useEffect(() => {
     const unlistenIndexing = listen<{message: string; path: string}>("indexing-progress", (event) => {
@@ -222,10 +250,12 @@ function App() {
       setView("settings");
       setScanLog(`Scanning: ${dir}\u2026`);
       setActivities(prev => [...prev.filter(a => a.id !== "indexing"), { id: "indexing", label: "Indexing Files", progress: 0 }]);
+      await invoke<ScannedFolder>("add_scanned_folder", { path: dir }).catch(() => {});
       const count = await invoke<number>("start_scan", { dir });
       setScanLog(`Found ${count} images. Indexing...`);
       setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, label: `Indexing (${count})` } : a));
       loadStories();
+      loadScannedFolders();
     } catch (e) { setScanLog(`Error: ${e}`); }
     finally { setIsScanning(false); }
   };
@@ -240,9 +270,77 @@ function App() {
       setScanLog(`Found ${count} images.`);
       setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, label: `Indexing (${count})` } : a));
       loadStories();
+      loadScannedFolders();
     } catch (e) { setScanLog(`Error: ${e}`); }
     finally { setIsScanning(false); }
   };
+
+  const handleAddScannedFolder = useCallback(async () => {
+    try {
+      const dir = await open({ directory: true, multiple: false, title: "Select a folder to scan" });
+      if (!dir) return;
+      const folder = await invoke<ScannedFolder>("add_scanned_folder", { path: dir });
+      setScannedFolders(prev => [folder, ...prev]);
+      setFolderAccessibility(prev => new Map(prev).set(folder.id, true));
+      setIsScanning(true);
+      setScanLog(`Scanning: ${dir}…`);
+      setActivities(prev => [...prev.filter(a => a.id !== "indexing"), { id: "indexing", label: "Indexing Files", progress: 0 }]);
+      const count = await invoke<number>("start_scan", { dir });
+      setScanLog(`Found ${count} images. Indexing...`);
+      setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, label: `Indexing (${count})` } : a));
+      loadStories();
+    } catch (e) {
+      setScanLog(`Error adding folder: ${e}`);
+    } finally {
+      setIsScanning(false);
+    }
+  }, [loadStories]);
+
+  const handleRemoveScannedFolder = useCallback(async (id: string) => {
+    try {
+      await invoke("remove_scanned_folder", { id });
+      setScannedFolders(prev => prev.filter(f => f.id !== id));
+      setFolderAccessibility(prev => { const m = new Map(prev); m.delete(id); return m; });
+    } catch (e) {
+      console.error("Failed to remove folder:", e);
+    }
+  }, []);
+
+  const handleToggleScannedFolder = useCallback(async (id: string) => {
+    setScannedFolders(prev => prev.map(f => f.id === id ? { ...f, is_enabled: !f.is_enabled } : f));
+    try {
+      const updated = await invoke<ScannedFolder>("toggle_scanned_folder", { id });
+      setScannedFolders(prev => prev.map(f => f.id === id ? updated : f));
+    } catch (e) {
+      // Revert optimistic update on failure
+      setScannedFolders(prev => prev.map(f => f.id === id ? { ...f, is_enabled: !f.is_enabled } : f));
+      console.error("Failed to toggle folder:", e);
+    }
+  }, []);
+
+  const handleToggleChildFolder = useCallback(async (parentPath: string, childName: string) => {
+    try {
+      await invoke<boolean>("toggle_child_override", { parentPath, childName });
+      // Refetch folder children to update their disabled state
+      // The FolderRow component will re-invoke get_folder_children when expanded again
+    } catch (e) {
+      console.error("Failed to toggle child folder:", e);
+    }
+  }, []);
+
+  const handleReScanFolders = useCallback(async () => {
+    setIsScanning(true);
+    try {
+      const count = await invoke<number>("start_scan_device");
+      setScanLog(`Re-scan complete. Found ${count} images.`);
+      loadStories();
+      loadScannedFolders();
+    } catch (e) {
+      setScanLog(`Re-scan error: ${e}`);
+    } finally {
+      setIsScanning(false);
+    }
+  }, [loadStories, loadScannedFolders]);
 
   const navigateToSettingsSection = (sectionId: string) => {
     setSettingsInitialSection(sectionId);
@@ -328,7 +426,11 @@ function App() {
         {view === "settings" && (
           <SettingsPanel scanLog={scanLog} isScanning={isScanning} onScan={handleAddLocation} onScanDevice={handleScanDevice}
             aiHealth={aiHealth} setAiHealth={setAiHealth} initialSection={settingsInitialSection}
-            onInitialSectionHandled={() => setSettingsInitialSection(null)} />
+            onInitialSectionHandled={() => setSettingsInitialSection(null)}
+            scannedFolders={scannedFolders} folderAccessibility={folderAccessibility}
+            onAddScannedFolder={handleAddScannedFolder} onRemoveScannedFolder={handleRemoveScannedFolder}
+            onToggleScannedFolder={handleToggleScannedFolder} onReScanFolders={handleReScanFolders}
+            onToggleChildFolder={handleToggleChildFolder} />
         )}
       </main>
 
