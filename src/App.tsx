@@ -379,7 +379,7 @@ function App() {
 
       {/* Navigation */}
       <nav className="relative z-10 flex flex-row sm:flex-col items-center justify-between sm:justify-start w-full sm:w-20 h-20 sm:h-full px-4 py-2 sm:py-12 sm:px-0 gap-2 sm:gap-6 shrink-0 border-t sm:border-t-0 sm:border-r border-neon-500/10 bg-surface-900/60 backdrop-blur-xl shadow-2xl">
-        <div className="logo hidden sm:flex items-center justify-center mb-4 mt-2">
+        <div className="hidden sm:flex items-center justify-center mb-4 mt-2">
           <Logo size="md" animated />
         </div>
 

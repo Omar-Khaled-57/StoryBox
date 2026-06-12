@@ -117,6 +117,8 @@ fn build_caption(all_tags: &[String], vibe: Option<&str>, color_vibe: Option<&st
 }
 
 /// Generate a random story from unfiltered images in the DB.
+/// Generates a template-based story using the most recent analyzed images, excluding
+/// images from disabled folders or overridden child folders.
 pub async fn generate_random_story(pool: &Pool<Sqlite>) -> Result<Option<Story>> {
     // Pick up to 8 random images, excluding any from disabled folders or overridden child folders
     let images: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
@@ -217,6 +219,8 @@ fn parse_tags(tags_json: Option<String>) -> Vec<String> {
 }
 
 /// Generate a story based on AI analysis or date clusters
+/// Generates an AI-powered story by analyzing image features, asking the AI for a
+/// caption, and assembling a story from the best images. Excludes images from disabled folders.
 pub async fn generate_ai_story(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> Result<Option<Story>> {
     // 1. Fetch analyzed images, excluding any from disabled folders or overridden child folders
     let features: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
@@ -419,6 +423,7 @@ pub async fn generate_ai_story(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> R
 }
 
 /// Fetch all stories with their images
+/// Fetches all stories ordered by pinned status and creation date, with their images.
 pub async fn get_all_stories(pool: &Pool<Sqlite>) -> Result<Vec<Story>> {
     let story_rows: Vec<(String, String, String, String, bool, bool)> = sqlx::query_as(
         "SELECT id, theme_type, COALESCE(caption, ''), created_at, is_favorite, is_pinned FROM stories ORDER BY is_pinned DESC, created_at DESC LIMIT 20"
@@ -477,6 +482,7 @@ pub async fn get_all_stories(pool: &Pool<Sqlite>) -> Result<Vec<Story>> {
 
 // --- Tauri Commands ---
 
+/// Attempts AI story generation; falls back to template-based if AI is mock or fails.
 pub async fn internal_generate_story(
     pool: &Pool<Sqlite>,
     app: &tauri::AppHandle
@@ -514,6 +520,7 @@ pub async fn internal_generate_story(
     }
 }
 
+/// Entry point for story generation: routes to AI or template depending on config.
 #[tauri::command]
 pub async fn generate_story(
     state: tauri::State<'_, Pool<Sqlite>>,
@@ -522,11 +529,14 @@ pub async fn generate_story(
     internal_generate_story(&*state, &app).await
 }
 
+/// Returns all stories with their images for the frontend feed.
 #[tauri::command]
 pub async fn get_stories(state: tauri::State<'_, Pool<Sqlite>>) -> Result<Vec<Story>, String> {
     get_all_stories(&*state).await.map_err(|e| e.to_string())
 }
 
+/// Returns a base64 data URI for an image (thumbnail or display) by id.
+/// Falls back to reading the original file if the cache is missing.
 #[tauri::command]
 pub async fn get_cached_image_base64(
     state: tauri::State<'_, Pool<Sqlite>>,
@@ -574,6 +584,7 @@ pub async fn get_cached_image_base64(
     Err("Image file not found on disk and no thumbnail available.".to_string())
 }
 
+/// Returns the current AI/intelligence processing status for the UI.
 #[tauri::command]
 pub async fn get_ai_status(
     state: tauri::State<'_, Pool<Sqlite>>,
@@ -620,6 +631,7 @@ pub async fn get_ai_status(
     })
 }
 
+/// Deletes a single story and its image associations by id.
 #[tauri::command]
 pub async fn delete_story(
     state: tauri::State<'_, Pool<Sqlite>>,
@@ -644,6 +656,7 @@ pub async fn delete_story(
     Ok(())
 }
 
+/// Deletes all non-favorited stories and their image associations.
 #[tauri::command]
 pub async fn delete_all_stories(
     state: tauri::State<'_, Pool<Sqlite>>,
@@ -665,7 +678,7 @@ pub async fn delete_all_stories(
     Ok(())
 }
 
-/// Task runner for periodic automation
+/// Periodic automation: generates stories on a schedule and cleans up old unpinned stories.
 pub async fn run_automation_tasks(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> Result<()> {
     // 1. Fetch current automation timers and intervals
     let row: Option<(Option<String>, Option<String>, i32, i32)> = sqlx::query_as(
@@ -742,6 +755,7 @@ pub async fn run_automation_tasks(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -
     Ok(())
 }
 
+/// Toggles the pinned state of a story and returns the new state.
 #[tauri::command]
 pub async fn toggle_story_pin(
     state: tauri::State<'_, Pool<Sqlite>>,
@@ -768,6 +782,7 @@ pub async fn toggle_story_pin(
     Ok(next)
 }
 
+/// Toggles the favorite state of a story and returns the new state.
 #[tauri::command]
 pub async fn toggle_story_favorite(
     state: tauri::State<'_, Pool<Sqlite>>,
@@ -794,6 +809,7 @@ pub async fn toggle_story_favorite(
     Ok(next)
 }
 
+/// Returns the current AI provider configuration for the frontend settings form.
 #[tauri::command]
 pub async fn get_ai_settings(state: tauri::State<'_, Pool<Sqlite>>) -> Result<(String, String, String, String, String, String, i32, i32), String> {
     let row: (String, String, String, String, String, String, i32, i32) = sqlx::query_as(
@@ -805,6 +821,7 @@ pub async fn get_ai_settings(state: tauri::State<'_, Pool<Sqlite>>) -> Result<(S
     Ok(row)
 }
 
+/// Persists the AI provider configuration from the frontend settings form.
 #[tauri::command]
 pub async fn update_ai_settings(
     state: tauri::State<'_, Pool<Sqlite>>,

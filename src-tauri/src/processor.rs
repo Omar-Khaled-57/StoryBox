@@ -1,9 +1,9 @@
 /// Background processing pipeline: indexing, thumbnail generation, and AI analysis.
 ///
 /// Architecture:
-/// 1. `start_processing_worker` — main event loop consuming index/analysis jobs from mpsc channels
-/// 2. `index_image` — inserts new images into DB, creates thumbnails, computes dominant color
-/// 3. `run_ai_analysis` — sends images to AI engine for tag/vibe extraction
+/// - `start_processing_worker` — main event loop consuming index/analysis jobs from mpsc channels
+/// - `index_image` — inserts new images into DB, creates thumbnails, computes dominant color
+/// - `run_ai_analysis` — sends images to AI engine for tag/vibe extraction
 ///
 /// Uses a two-stage semaphore (indexing:analysis) that dynamically shifts capacity
 /// from 8:2 to 2:8 as indexing nears completion.
@@ -197,6 +197,7 @@ pub async fn start_processing_worker(
     }
 }
 
+/// Re-queues images with garbled or missing AI tags for re-analysis.
 #[tauri::command]
 pub async fn trigger_junk_reanalysis(
     pool: tauri::State<'_, Pool<Sqlite>>,
@@ -332,6 +333,7 @@ pub async fn internal_trigger_junk_reanalysis(
     Ok(repaired)
 }
 
+/// Pauses the image indexing pipeline.
 #[tauri::command]
 pub async fn stop_indexing(state: tauri::State<'_, Arc<ProcessingState>>) -> Result<(), String> {
     state.stop_indexing.store(true, Ordering::Relaxed);
@@ -339,6 +341,7 @@ pub async fn stop_indexing(state: tauri::State<'_, Arc<ProcessingState>>) -> Res
     Ok(())
 }
 
+/// Pauses the AI analysis pipeline.
 #[tauri::command]
 pub async fn stop_analysis(state: tauri::State<'_, Arc<ProcessingState>>) -> Result<(), String> {
     state.stop_analysis.store(true, Ordering::Relaxed);
@@ -346,6 +349,7 @@ pub async fn stop_analysis(state: tauri::State<'_, Arc<ProcessingState>>) -> Res
     Ok(())
 }
 
+/// Resumes the image indexing pipeline.
 #[tauri::command]
 pub async fn resume_indexing(state: tauri::State<'_, Arc<ProcessingState>>) -> Result<(), String> {
     state.stop_indexing.store(false, Ordering::Relaxed);
@@ -353,6 +357,7 @@ pub async fn resume_indexing(state: tauri::State<'_, Arc<ProcessingState>>) -> R
     Ok(())
 }
 
+/// Resumes the AI analysis pipeline.
 #[tauri::command]
 pub async fn resume_analysis(state: tauri::State<'_ , Arc<ProcessingState>>) -> Result<(), String> {
     state.stop_analysis.store(false, Ordering::Relaxed);
@@ -360,6 +365,7 @@ pub async fn resume_analysis(state: tauri::State<'_ , Arc<ProcessingState>>) -> 
     Ok(())
 }
 
+/// Resumes both indexing and analysis pipelines simultaneously.
 #[tauri::command]
 pub async fn resume_processing(state: tauri::State<'_, Arc<ProcessingState>>) -> Result<(), String> {
     state.stop_indexing.store(false, Ordering::Relaxed);

@@ -1,10 +1,8 @@
-/// File system scanner: discovers image files from user directories or selected folders.
+/// Discovers image files from the filesystem, managing both default device paths and
+/// user-configured scanned folders. Platform-specific discovery for Windows (OneDrive),
+/// macOS (Photos library), Linux (~/Pictures), and mobile (emits events for frontend).
 ///
-/// Platforms:
-/// - Windows: scans OneDrive/Pictures, user-selected folders
-/// - macOS: scans Photos library originals, ~/Pictures
-/// - Linux: scans ~/Pictures
-/// - iOS/Android: emits events for the frontend to push photo data
+/// Also manages the scanned_folders persistence layer and child folder override toggles.
 use crate::processor::{IndexingJob, ProcessingState};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -24,6 +22,7 @@ pub struct ScannedFolder {
     pub added_at: String,
 }
 
+/// Returns all enabled scanned folders from the database.
 pub async fn get_enabled_folders(pool: &Pool<Sqlite>) -> Vec<ScannedFolder> {
     sqlx::query_as::<_, (String, String, bool, String)>(
         "SELECT id, path, is_enabled, COALESCE(added_at, '') FROM scanned_folders WHERE is_enabled = 1 ORDER BY added_at DESC"
@@ -36,6 +35,7 @@ pub async fn get_enabled_folders(pool: &Pool<Sqlite>) -> Vec<ScannedFolder> {
     .collect()
 }
 
+/// Returns all scanned folders (both enabled and disabled) from the database.
 pub async fn get_all_folders(pool: &Pool<Sqlite>) -> Vec<ScannedFolder> {
     sqlx::query_as::<_, (String, String, bool, String)>(
         "SELECT id, path, is_enabled, COALESCE(added_at, '') FROM scanned_folders ORDER BY added_at DESC"
@@ -48,6 +48,7 @@ pub async fn get_all_folders(pool: &Pool<Sqlite>) -> Vec<ScannedFolder> {
     .collect()
 }
 
+/// Scans all enabled persisted folders, returning the total image count found.
 pub async fn scan_persisted_folders(
     pool: &Pool<Sqlite>,
     tx: &Sender<IndexingJob>,
@@ -67,11 +68,13 @@ pub async fn scan_persisted_folders(
     Ok(total_count)
 }
 
+/// Returns all scanned folders (enabled and disabled) for the UI.
 #[tauri::command]
 pub async fn get_scanned_folders(pool: tauri::State<'_, Pool<Sqlite>>) -> Result<Vec<ScannedFolder>, String> {
     Ok(get_all_folders(&pool).await)
 }
 
+/// Persists a folder path to the scanned_folders table and returns the new row.
 #[tauri::command]
 pub async fn add_scanned_folder(
     path: String,
@@ -95,6 +98,7 @@ pub async fn add_scanned_folder(
     Ok(ScannedFolder { id: row.0, path: row.1, is_enabled: row.2, added_at: row.3 })
 }
 
+/// Removes a folder from the scanned_folders table by id.
 #[tauri::command]
 pub async fn remove_scanned_folder(id: String, pool: tauri::State<'_, Pool<Sqlite>>) -> Result<(), String> {
     sqlx::query("DELETE FROM scanned_folders WHERE id = ?")
@@ -105,6 +109,7 @@ pub async fn remove_scanned_folder(id: String, pool: tauri::State<'_, Pool<Sqlit
     Ok(())
 }
 
+/// Flips is_enabled for a scanned folder and returns the updated row.
 #[tauri::command]
 pub async fn toggle_scanned_folder(id: String, pool: tauri::State<'_, Pool<Sqlite>>) -> Result<ScannedFolder, String> {
     sqlx::query("UPDATE scanned_folders SET is_enabled = CASE WHEN is_enabled = 1 THEN 0 ELSE 1 END WHERE id = ?")
@@ -122,6 +127,7 @@ pub async fn toggle_scanned_folder(id: String, pool: tauri::State<'_, Pool<Sqlit
     Ok(ScannedFolder { id: row.0, path: row.1, is_enabled: row.2, added_at: row.3 })
 }
 
+/// Checks which scanned folders still exist on disk; returns accessibility per folder.
 #[tauri::command]
 pub async fn check_folders_accessibility(pool: tauri::State<'_, Pool<Sqlite>>) -> Result<Vec<serde_json::Value>, String> {
     let folders = get_all_folders(&pool).await;
@@ -145,6 +151,7 @@ pub struct FolderChild {
     pub disabled: bool,
 }
 
+/// Lists immediate subdirectories of a folder, annotated with their disabled-override state.
 #[tauri::command]
 pub async fn get_folder_children(
     path: String,
@@ -178,6 +185,8 @@ pub async fn get_folder_children(
     Ok(children)
 }
 
+/// Toggles whether a specific child folder is disabled within its parent.
+/// Inserts a row on disable, removes it on re-enable.
 #[tauri::command]
 pub async fn toggle_child_override(
     parent_path: String,
@@ -222,6 +231,7 @@ pub async fn toggle_child_override(
     }
 }
 
+/// Recursively walks a directory, sending each image file as an IndexingJob through the channel.
 pub async fn scan_directory(dir: &Path, tx: &Sender<IndexingJob>, state: Arc<ProcessingState>) -> Result<usize> {
     // We do a simple blocking walkdir inside a spawned blocking thread.
     let dir = dir.to_path_buf();
@@ -257,6 +267,7 @@ pub async fn scan_directory(dir: &Path, tx: &Sender<IndexingJob>, state: Arc<Pro
     Ok(added_count)
 }
 
+/// Scans a single directory path and emits scan-complete with the count.
 #[tauri::command]
 pub async fn start_scan(
     dir: String,
@@ -274,6 +285,7 @@ pub async fn start_scan(
     Ok(count)
 }
 
+/// Scans all default device paths (Pictures, OneDrive, etc.) and persisted enabled folders.
 #[tauri::command]
 pub async fn start_scan_device(
     state: tauri::State<'_, Sender<IndexingJob>>, 
@@ -284,45 +296,21 @@ pub async fn start_scan_device(
     internal_scan_device(&*state, proc_state.inner().clone(), &handle, Some(&pool)).await
 }
 
-pub async fn internal_scan_device(
-    tx: &Sender<IndexingJob>, 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn desktop_scan(
+    tx: &Sender<IndexingJob>,
     proc_state: Arc<ProcessingState>,
     handle: &tauri::AppHandle,
     pool: Option<&Pool<Sqlite>>,
 ) -> Result<usize, String> {
     use tauri::Emitter;
     let mut total_count = 0;
-    
     let mut search_paths = Vec::new();
-
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    println!("[Scanner] Platform detected: Mobile");
-    #[cfg(target_os = "windows")]
-    println!("[Scanner] Platform detected: Windows");
-    #[cfg(target_os = "macos")]
-    println!("[Scanner] Platform detected: macOS");
-    #[cfg(target_os = "linux")]
-    println!("[Scanner] Platform detected: Linux");
-
-    // On mobile (Android / iOS) we delegate scanning to the frontend, which
-    // uses the platform-specific photo library plugin to fetch images and
-    // sends them back to the backend for indexing.
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    {
-        if cfg!(target_os = "ios") {
-            println!("[Scanner] iOS detected — using iOS Photos plugin for library access.");
-        } else {
-            println!("[Scanner] Android detected — using medialibrary plugin for content access.");
-        }
-        let _ = handle.emit("trigger-mobile-scan", ());
-        return Ok(0);
-    }
 
     if let Some(user_dirs) = UserDirs::new() {
         if let Some(p) = user_dirs.picture_dir() { search_paths.push(p.to_path_buf()); }
     }
 
-    // Windows-specific: Add OneDrive Pictures if it exists
     #[cfg(target_os = "windows")]
     {
         if let Ok(home) = std::env::var("USERPROFILE") {
@@ -330,27 +318,21 @@ pub async fn internal_scan_device(
             let onedrive_variants = vec!["OneDrive", "One Drive"];
             for var in onedrive_variants {
                 let od_pics = home_path.join(var).join("Pictures");
-                if od_pics.exists() { 
-                    search_paths.push(od_pics); 
-                }
+                if od_pics.exists() { search_paths.push(od_pics); }
             }
         }
     }
 
-    // macOS-specific: Add Apple Photos library discovery
     #[cfg(target_os = "macos")]
     {
         if let Some(user_dirs) = UserDirs::new() {
             if let Some(home) = user_dirs.home_dir() {
                 let photos_lib = home.join("Pictures").join("Photos Library.photoslibrary").join("originals");
-                if photos_lib.exists() {
-                    search_paths.push(photos_lib);
-                }
+                if photos_lib.exists() { search_paths.push(photos_lib); }
             }
         }
     }
 
-    // Linux-specific: Ensure standard Pictures folder is searched even if UserDirs fails
     #[cfg(target_os = "linux")]
     {
         if let Ok(home) = std::env::var("HOME") {
@@ -359,11 +341,9 @@ pub async fn internal_scan_device(
         }
     }
 
-    // De-duplicate paths
     search_paths.sort();
     search_paths.dedup();
 
-    // Persist discovered paths to the scanned_folders table so they appear in the UI
     if let Some(pool) = pool {
         use uuid::Uuid;
         for p in &search_paths {
@@ -375,7 +355,6 @@ pub async fn internal_scan_device(
                 .execute(pool)
                 .await;
         }
-        // Remove any paths the user has explicitly disabled from the scan list
         let disabled: Vec<String> = sqlx::query_as::<_, (String,)>(
             "SELECT path FROM scanned_folders WHERE is_enabled = 0"
         )
@@ -390,7 +369,6 @@ pub async fn internal_scan_device(
 
     for p in search_paths {
         if p.exists() {
-            println!("[Scanner] Auto-scanning: {:?}", p);
             match scan_directory(&p, tx, proc_state.clone()).await {
                 Ok(c) => total_count += c,
                 Err(e) => eprintln!("Error scanning {:?}: {}", p, e),
@@ -398,7 +376,6 @@ pub async fn internal_scan_device(
         }
     }
 
-    // Also scan persisted enabled folders from the database
     if let Some(pool) = pool {
         match scan_persisted_folders(pool, tx, proc_state.clone()).await {
             Ok(c) => total_count += c,
@@ -408,4 +385,25 @@ pub async fn internal_scan_device(
 
     let _ = handle.emit("scan-complete", total_count);
     Ok(total_count)
+}
+
+/// Core device scanning logic: discovers default paths per platform, persists them, filters
+/// disabled folders, then scans all enabled paths and persisted folders from the database.
+///
+/// On mobile targets, delegates scanning to the frontend via a trigger-mobile-scan event.
+pub async fn internal_scan_device(
+    tx: &Sender<IndexingJob>,
+    proc_state: Arc<ProcessingState>,
+    handle: &tauri::AppHandle,
+    pool: Option<&Pool<Sqlite>>,
+) -> Result<usize, String> {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        use tauri::Emitter;
+        let _ = handle.emit("trigger-mobile-scan", ());
+        return Ok(0);
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    desktop_scan(tx, proc_state, handle, pool).await
 }
