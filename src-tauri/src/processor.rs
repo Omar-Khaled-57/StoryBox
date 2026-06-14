@@ -86,25 +86,26 @@ pub async fn start_processing_worker(
     let analysis_state = state.clone();
     
     tokio::spawn(async move {
-        while let Some(job) = analysis_rx.recv().await {
-            // Priority: Wait until 70% of current scan is indexed
-            loop {
-                if analysis_state.stop_analysis.load(Ordering::Relaxed) {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    continue;
-                }
-
-                let total = analysis_state.total_found.load(Ordering::Relaxed);
-                let indexed = analysis_state.indexed_count.load(Ordering::Relaxed);
-                
-                // Only wait if there's actually a substantial amount of work and we haven't hit 70%
-                if total > 5 && (indexed as f32 / total as f32) < 0.7 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    continue;
-                }
-                break;
+        // Gate: Wait until 70% of indexing is complete before starting analysis
+        loop {
+            if analysis_state.stop_analysis.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
             }
 
+            let total = analysis_state.total_found.load(Ordering::Relaxed);
+            let indexed = analysis_state.indexed_count.load(Ordering::Relaxed);
+
+            if total > 5 && (indexed as f32 / total as f32) < 0.7 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+            break;
+        }
+
+        println!("[Analysis] Indexing past 70%, starting analysis worker");
+
+        while let Some(job) = analysis_rx.recv().await {
             let pool = analysis_pool.clone();
             let ai = analysis_ai.clone();
             let handle = analysis_handle.clone();
@@ -168,7 +169,16 @@ pub async fn start_processing_worker(
             match tokio::time::timeout(timeout_duration, index_image(job.path.clone(), &pool, &thumbs, &display, &handle)).await {
                 Ok(Ok(Some(analysis_job))) => {
                     index_state.indexed_count.fetch_add(1, Ordering::Relaxed);
-                    let _ = a_tx.send(analysis_job).await;
+                    // Non-blocking send — analysis channel full is not a reason to deadlock indexing
+                    match a_tx.try_send(analysis_job) {
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
+                            eprintln!("[Processor] Analysis queue full, skipping later re-analysis for {}", job.file_name);
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            eprintln!("[Processor] Analysis channel closed");
+                        }
+                        Ok(_) => {}
+                    }
                 }
                 Ok(Ok(None)) => {
                     index_state.indexed_count.fetch_add(1, Ordering::Relaxed);
@@ -220,19 +230,28 @@ pub async fn internal_trigger_junk_reanalysis(
     let thumbs_dir = app_dir.join("thumbnails");
     let display_dir = app_dir.join("display");
 
-    // 1. Find images with missing thumbnails or junk tags in one JOIN query
-    let items: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT i.id, i.path, f.tags 
-         FROM images i 
-         LEFT JOIN image_features f ON i.id = f.image_id"
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
     let mut repaired = 0;
-    
-    for (id, path, tags) in items {
+    let batch_size = 100;
+
+    loop {
+        // Process in batches to keep memory bounded
+        let items: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT i.id, i.path, f.tags 
+             FROM images i 
+             LEFT JOIN image_features f ON i.id = f.image_id
+             LIMIT ? OFFSET ?"
+        )
+        .bind(batch_size)
+        .bind(repaired as i64)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if items.is_empty() {
+            break;
+        }
+
+        for (id, path, tags) in items {
         let thumb_path = thumbs_dir.join(format!("{}.jpg", id));
         let display_path = display_dir.join(format!("{}.jpg", id));
         
@@ -253,10 +272,11 @@ pub async fn internal_trigger_junk_reanalysis(
                         let id = id.clone();
                         move || {
                             let img = image::open(&path_buf).ok()?;
-                            let thumb = img.thumbnail(500, 500);
-                            let _ = thumb.save(&thumbs_dir.join(format!("{}.jpg", id)));
                             let display = img.thumbnail(1080, 1080);
+                            drop(img);
                             let _ = display.save(&display_dir.join(format!("{}.jpg", id)));
+                            let thumb = display.thumbnail(500, 500);
+                            let _ = thumb.save(&thumbs_dir.join(format!("{}.jpg", id)));
                             Some(())
                         }
                     }).await;
@@ -293,7 +313,7 @@ pub async fn internal_trigger_junk_reanalysis(
                             .flat_map(|&f| f.to_ne_bytes())
                             .collect();
 
-                        if let Some(color) = analysis.dominant_color {
+            if let Some(ref color) = analysis.dominant_color {
                             let _ = sqlx::query(
                                 "UPDATE image_features SET tags=?, dominant_color=?, vibe=?, embedding=? WHERE image_id=?"
                             )
@@ -328,7 +348,8 @@ pub async fn internal_trigger_junk_reanalysis(
                 repaired += 1;
             }
         }
-    }
+    } // end for
+    } // end loop
 
     Ok(repaired)
 }
@@ -383,11 +404,10 @@ pub async fn index_mobile_image(
     indexing_tx: tauri::State<'_, mpsc::Sender<IndexingJob>>,
     state: tauri::State<'_, Arc<ProcessingState>>,
 ) -> Result<(), String> {
-    state.total_found.fetch_add(1, Ordering::Relaxed);
     let path_buf = PathBuf::from(path);
-    if let Err(e) = indexing_tx.send(IndexingJob { path: path_buf }).await {
-        return Err(format!("Failed to queue mobile image: {}", e));
-    }
+    indexing_tx.send(IndexingJob { path: path_buf }).await
+        .map(|_| state.total_found.fetch_add(1, Ordering::Relaxed))
+        .map_err(|e| format!("Failed to queue mobile image: {}", e))?;
     Ok(())
 }
 
@@ -426,10 +446,11 @@ async fn index_image(
 
                 let _ = tokio::task::spawn_blocking(move || {
                     let img = image::open(&path_clone).ok()?;
-                    let thumb = img.thumbnail(500, 500);
-                    let _ = thumb.save(&thumbs_dir_clone.join(format!("{}.jpg", id_clone)));
                     let display = img.thumbnail(1080, 1080);
+                    drop(img);
                     let _ = display.save(&display_dir_clone.join(format!("{}.jpg", id_clone)));
+                    let thumb = display.thumbnail(500, 500);
+                    let _ = thumb.save(&thumbs_dir_clone.join(format!("{}.jpg", id_clone)));
                     Some(())
                 }).await;
                 
@@ -448,14 +469,18 @@ async fn index_image(
                     let img = match image::open(&path_clone) {
                         Ok(i) => i,
                         Err(_e) => {
-                            // Silence these to avoid console spam with junk files
                             return Ok(None);
                         }
                     };
 
-                    let thumb = img.thumbnail(500, 500);
-                    
-                    // Simple Dominant Color (Average RGB)
+                    // Create display (1080px) first, then drop full img to free ~72MB per worker
+                    let display = img.thumbnail(1080, 1080);
+                    drop(img);
+
+                    // Create thumb from the display version — negligible quality difference vs original
+                    let thumb = display.thumbnail(500, 500);
+
+                    // Dominant color from thumb pixels
                     let mut r_acc = 0u64;
                     let mut g_acc = 0u64;
                     let mut b_acc = 0u64;
@@ -466,7 +491,7 @@ async fn index_image(
                         b_acc += pixel[2] as u64;
                         pix_count += 1;
                     }
-                    
+
                     if pix_count == 0 {
                         return Ok(None);
                     }
@@ -479,7 +504,6 @@ async fn index_image(
                         return Ok(None);
                     }
 
-                    let display = img.thumbnail(1080, 1080);
                     let display_path = display_dir_clone.join(format!("{}.jpg", id_clone));
                     if let Err(e) = display.save(&display_path) {
                         eprintln!("[Processor] ERROR: Failed to save display image for {}: {}", path_clone.display(), e);
@@ -536,6 +560,13 @@ async fn run_ai_analysis(
 ) -> Result<()> {
     use tauri::Emitter;
 
+    // Use the cached 1080px display image if available instead of decoding the original
+    let app_dir = app_handle.path().app_local_data_dir().ok();
+    let display_path = app_dir.map(|d| d.join("display").join(format!("{}.jpg", job.id)));
+    let analysis_path = display_path.as_ref()
+        .filter(|p| p.exists())
+        .unwrap_or(&job.path);
+
     // Fetch AI Settings for analysis
     let settings: (String, String, String, String, String, String) = sqlx::query_as(
         "SELECT provider, base_url, model_name, vision_model_name, api_key, proxy_url FROM ai_settings WHERE id = 1"
@@ -551,8 +582,8 @@ async fn run_ai_analysis(
         ai::DEFAULT_PROXY_URL.to_string(),
     ));
 
-    // Run AI Analysis
-    match ai_engine.analyze_image(&job.path, &settings.0, &settings.1, &settings.3, &settings.4, &settings.5).await {
+    // Run AI Analysis with the smaller display image (or original as fallback)
+    match ai_engine.analyze_image(analysis_path, &settings.0, &settings.1, &settings.3, &settings.4, &settings.5).await {
         Ok(analysis) => {
             let tags_json = serde_json::to_string(&analysis.tags)?;
             let embedding_bytes: Vec<u8> = analysis
@@ -560,8 +591,9 @@ async fn run_ai_analysis(
                 .iter()
                 .flat_map(|&f| f.to_ne_bytes())
                 .collect();
+            let dominant_color = analysis.dominant_color.clone();
 
-            if let Some(color) = analysis.dominant_color {
+            if let Some(ref color) = analysis.dominant_color {
                 sqlx::query(
                     "UPDATE image_features SET tags=?, dominant_color=?, vibe=?, embedding=? WHERE image_id=?"
                 )
@@ -588,6 +620,11 @@ async fn run_ai_analysis(
                 .bind(&job.id)
                 .execute(pool)
                 .await?;
+
+            // Update in-memory cache so UI sees fresh data immediately
+            if let Some(cache) = app_handle.try_state::<Arc<crate::cache::ImageCache>>() {
+                cache.update_analysis(&job.id, analysis.tags, Some(analysis.vibe), dominant_color);
+            }
 
             let _ = app_handle.emit("analysis-progress", serde_json::json!({
                 "message": format!("AI Analysis complete for: {}", job.file_name),

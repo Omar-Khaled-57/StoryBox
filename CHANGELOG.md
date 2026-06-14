@@ -4,6 +4,43 @@ A running log of every change, fix, and decision during development. Newest entr
 
 ---
 
+## v3.0.2 — Architecture & Mobile Reliability · 2025-06-14
+
+**Focus**: Production‑ready architecture — in‑memory image cache, filesystem watcher, startup optimization, and reliable mobile file access via SAF + `tauri-plugin-fs`.
+
+### 🚀 New
+
+- **`cache.rs`** — in‑memory `ImageCache` (`RwLock<HashMap>`) loaded from DB at startup for instant image lookups during story generation; count emitted immediately as `scan‑complete` so the UI never blocks.
+- **`watcher.rs`** — `FolderWatcher` using `notify` crate (inotify/FSEvent/ReadDirectoryChanges); monitors all enabled `scanned_folders` recursively and auto‑queues new image files into the indexing pipeline.
+- **Mobile scanning via SAF** — replaces broken `@universalappfactory/tauri-plugin-medialibrary` and `@gbyte/tauri-plugin-ios-photos` with `tauri‑plugin‑dialog` (folder picker) + `tauri‑plugin‑fs` (`readDir`/`readFile`); works on Android 10+ scoped storage and iOS sandbox.
+
+### 🔧 Backend
+
+- **Startup no longer rescans** — loads image count from DB, emits `scan‑complete` immediately; background discovery still runs for new/default paths.
+- **Removed unused plugins** — `tauri‑plugin‑medialibrary` and `tauri‑plugin‑ios‑photos` deleted from `Cargo.toml` and `lib.rs` (both unreliable on Tauri v2).
+- **`ImageCache` managed as Tauri state** — refreshable via `load_from_db()` after background scans complete.
+- **File scope via capabilities** — dropped invalid `plugins.fs.scope` from `tauri.conf.json`; properly scoped `fs:default` with `$APPDATA`, `$HOME`, `$PICTURE`, `$DOWNLOAD`, `$DOCUMENT`, `$TEMP` paths in `src‑tauri/capabilities/default.json`.
+
+### 🎨 Frontend
+
+- **`walkDir()` recursive walker** — uses `readDir`/`readFile` from `@tauri-apps/plugin-fs` to enumerate image files from SAF URIs; sends each via base64 to `index_ios_image_data`.
+- **Mobile `handleScanDevice`** — opens SAF folder picker instead of auto‑discovering default paths; `handleReScanFolders` works identically.
+- **Desktop path unchanged** — existing `walkdir`‑based Rust scanning preserved for desktop.
+
+### 🧹 Changes
+
+| File | What changed |
+|------|-------------|
+| `src-tauri/src/cache.rs` | **New** — `ImageCache` with `load_from_db`, `get_random_analyzed`, `insert`, `remove` |
+| `src-tauri/src/watcher.rs` | **New** — `FolderWatcher::start()` using `notify` crate, desktop‑only (`#[cfg]`) |
+| `src-tauri/Cargo.toml` | Added `notify = "7"`, removed `tauri-plugin-medialibrary`, removed `tauri-plugin-ios-photos` |
+| `src-tauri/src/lib.rs` | Integrated cache + watcher in setup; removed plugin registrations; startup emits DB count |
+| `src-tauri/tauri.conf.json` | Removed invalid `plugins.fs.scope` |
+| `src-tauri/capabilities/default.json` | Scoped `fs:default` with allow paths |
+| `src/App.tsx` | Rewrote `trigger‑mobile‑scan` handler to use `tauri‑plugin‑dialog` + `tauri‑plugin‑fs`; added `walkDir`; mobile‑aware `handleScanDevice`/`handleReScanFolders` |
+
+---
+
 ## v3.0.1 — Scanned Folders Management · 2025-06-01
 
 **Focus**: Add persistent Scanned Folder management with subfolder toggle hierarchy.

@@ -62,7 +62,7 @@ export default function SettingsPanel({
 
   const analyzedPct = aiStatus && aiStatus.total_images > 0 ? Math.round((aiStatus.analyzed_images / aiStatus.total_images) * 100) : 0;
   const indexingPct = aiStatus && aiStatus.total_found > 0 ? Math.round((aiStatus.indexed_count / aiStatus.total_found) * 100) : 100;
-  const isPrioritizingIndexing = aiStatus && aiStatus.total_found > 5 && (aiStatus.indexed_count / aiStatus.total_found) < 0.7;
+  const isPrioritizingIndexing = aiStatus && aiStatus.total_found > 5 && aiStatus.indexed_count < aiStatus.total_found;
 
   return (
     <div className="absolute inset-0 overflow-y-auto overflow-x-hidden scroll-smooth">

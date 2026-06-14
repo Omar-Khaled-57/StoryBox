@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -117,7 +117,14 @@ function App() {
     loadScannedFolders();
   }, [loadScannedFolders]);
 
+  const loadStoriesDebounced = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   useEffect(() => {
+    const queueLoadStories = () => {
+      if (loadStoriesDebounced.current) clearTimeout(loadStoriesDebounced.current);
+      loadStoriesDebounced.current = setTimeout(() => loadStories(), 500);
+    };
+
     const unlistenIndexing = listen<{message: string; path: string}>("indexing-progress", (event) => {
       setActivities(prev => {
         const idx = prev.findIndex(a => a.id === "indexing");
@@ -148,51 +155,14 @@ function App() {
         return newActivities;
       });
       setScanLog(event.payload.message);
-      loadStories();
+      queueLoadStories();
     });
 
     const unlistenRefresh = listen("refresh-stories", () => { loadStories(); });
     const unlistenNoPhotos = listen("no-photos-found", () => { setShowNoPhotosPopup(true); });
 
     const unlistenMobileScan = listen("trigger-mobile-scan", async (_event) => {
-      const isIOS = navigator.userAgent.includes("iPhone") || navigator.userAgent.includes("iPad");
-      if (isIOS) {
-        try {
-          const ios = await import("@gbyte/tauri-plugin-ios-photos");
-          const status = await ios.requestPhotosAuth();
-          if (status !== ios.PhotosAuthorizationStatus.authorized && status !== ios.PhotosAuthorizationStatus.limited) return;
-          const albums = await ios.requestAlbums({ with: ios.PHAssetCollectionType.smartAlbum, subtype: ios.PHAssetCollectionSubtype.smartAlbumUserLibrary });
-          const userAlbum = albums.find(() => true);
-          if (!userAlbum) return;
-          const medias = await ios.requestAlbumMedias({ id: userAlbum.id, height: 1080, width: 1080, quality: 80 });
-          const items = medias || [];
-          setActivities(prev => [...prev.filter(a => a.id !== "indexing"), { id: "indexing", label: `Indexing iOS Photos (${items.length})`, progress: 0 }]);
-          for (let i = 0; i < items.length; i += 5) {
-            const chunk = items.slice(i, i + 5);
-            await Promise.all(chunk.map((item, idx) => invoke("index_ios_image_data", { data: item.data || "", fileName: `ios_${item.id}_${idx}.jpg` })));
-            setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, progress: Math.min((i / items.length) * 100, 99) } : a));
-          }
-          setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, label: "iOS Scan Complete", progress: 100 } : a));
-          setTimeout(() => setActivities(prev => prev.filter(a => a.id !== "indexing")), 5000);
-          loadStories();
-        } catch (e) { console.error("[App] iOS scan failed:", e); }
-        return;
-      }
-      try {
-        const { requestPermissions, getImages, MediaLibrarySource } = await import("@universalappfactory/tauri-plugin-medialibrary");
-        await requestPermissions({ source: MediaLibrarySource.ExternalStorage });
-        const result = await getImages({ limit: 1000, offset: 0, source: MediaLibrarySource.ExternalStorage });
-        const images = result?.items || [];
-        setActivities(prev => [...prev.filter(a => a.id !== "indexing"), { id: "indexing", label: `Indexing Mobile (${images.length})`, progress: 0 }]);
-        for (let i = 0; i < images.length; i += 5) {
-          const chunk = images.slice(i, i + 5);
-          await Promise.all(chunk.map((img: any) => invoke("index_mobile_image", { path: img.path })));
-          setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, progress: Math.min((i / images.length) * 100, 99) } : a));
-        }
-        setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, label: "Mobile Scan Complete", progress: 100 } : a));
-        setTimeout(() => setActivities(prev => prev.filter(a => a.id !== "indexing")), 5000);
-        loadStories();
-      } catch (e) { console.error("[App] Android scan failed:", e); }
+      await runMobileScan();
     });
 
     const unlistenScanComplete = listen<number>("scan-complete", (event) => {
@@ -216,11 +186,12 @@ function App() {
     }, 15000);
 
     return () => {
+      if (loadStoriesDebounced.current) clearTimeout(loadStoriesDebounced.current);
       clearInterval(aiRetry);
       Promise.all([unlistenIndexing, unlistenAnalysis, unlistenRefresh, unlistenNoPhotos, unlistenMobileScan, unlistenScanComplete, unlistenAiHealth, unlistenStoryUpdated])
         .then(fns => fns.forEach(f => f()));
     };
-  }, [loadStories, aiHealth]);
+  }, [loadStories, loadScannedFolders, aiHealth]);
 
   const handleGenerateStory = async () => {
     setIsGenerating(true);
@@ -243,6 +214,7 @@ function App() {
   };
 
   const handleAddLocation = async () => {
+    if (isMobile) { await runMobileScan(); return; }
     try {
       const dir = await open({ directory: true, multiple: false });
       if (!dir) return;
@@ -260,7 +232,66 @@ function App() {
     finally { setIsScanning(false); }
   };
 
+  const isMobile = /android|iphone|ipad|ipod/i.test(navigator.userAgent);
+
+  const walkDir = async (dir: string): Promise<{name: string; fullPath: string}[]> => {
+    const { readDir } = await import("@tauri-apps/plugin-fs");
+    const entries = await readDir(dir);
+    const files: {name: string; fullPath: string}[] = [];
+    for (const entry of entries) {
+      const childPath = dir.includes("/tree/")
+        ? dir.replace("/tree/", "/document/") + "%2F" + encodeURIComponent(entry.name)
+        : dir.replace(/\/$/, "") + "/" + entry.name;
+      if (entry.isDirectory) {
+        const sub = await walkDir(childPath);
+        files.push(...sub);
+      } else if (entry.isFile && /\.(jpg|jpeg|png|webp)$/i.test(entry.name)) {
+        files.push({ name: entry.name, fullPath: childPath });
+      }
+    }
+    return files;
+  };
+
+  const runMobileScan = async () => {
+    setIsScanning(true);
+    try {
+      const { readFile } = await import("@tauri-apps/plugin-fs");
+      const dir = await open({ directory: true, multiple: false, title: "Select your photos folder" });
+      if (!dir) { setIsScanning(false); return; }
+      setScanLog(`Scanning: ${dir}`);
+      setActivities(prev => [...prev.filter(a => a.id !== "indexing"), { id: "indexing", label: "Scanning Folder", progress: 0 }]);
+      await invoke("add_scanned_folder", { path: dir }).catch(() => {});
+      const imageFiles = await walkDir(dir);
+      setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, label: `Indexing (${imageFiles.length} found)`, progress: 0 } : a));
+      for (let i = 0; i < imageFiles.length; i += 3) {
+        const chunk = imageFiles.slice(i, i + 3);
+        await Promise.all(chunk.map(async entry => {
+          try {
+            const uint8 = new Uint8Array(await readFile(entry.fullPath));
+            const binary = new TextDecoder("latin1").decode(uint8);
+            await invoke("index_ios_image_data", { data: btoa(binary), fileName: entry.name });
+          } catch (e) {
+            console.error("[Mobile] Failed to index:", entry.fullPath, e);
+          }
+        }));
+        if (imageFiles.length > 0) {
+          setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, progress: Math.min((i / imageFiles.length) * 100, 99) } : a));
+        }
+      }
+      setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, label: "Scan Complete", progress: 100 } : a));
+      setTimeout(() => setActivities(prev => prev.filter(a => a.id !== "indexing")), 5000);
+      loadStories();
+      loadScannedFolders();
+    } catch (e) {
+      console.error("[Mobile] Scan failed:", e);
+      setScanLog(`Scan error: ${e}`);
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
   const handleScanDevice = async () => {
+    if (isMobile) { await runMobileScan(); return; }
     try {
       setIsScanning(true);
       setView("settings");
@@ -276,6 +307,7 @@ function App() {
   };
 
   const handleAddScannedFolder = useCallback(async () => {
+    if (isMobile) { await runMobileScan(); return; }
     try {
       const dir = await open({ directory: true, multiple: false, title: "Select a folder to scan" });
       if (!dir) return;
@@ -329,6 +361,7 @@ function App() {
   }, []);
 
   const handleReScanFolders = useCallback(async () => {
+    if (isMobile) { await runMobileScan(); return; }
     setIsScanning(true);
     try {
       const count = await invoke<number>("start_scan_device");
@@ -378,7 +411,7 @@ function App() {
       </div>
 
       {/* Navigation */}
-      <nav className="relative z-10 flex flex-row sm:flex-col items-center justify-between sm:justify-start w-full sm:w-20 h-20 sm:h-full px-4 py-2 sm:py-12 sm:px-0 gap-2 sm:gap-6 shrink-0 border-t sm:border-t-0 sm:border-r border-neon-500/10 bg-surface-900/60 backdrop-blur-xl shadow-2xl">
+      <nav className="relative z-10 flex flex-row sm:flex-col items-center justify-between sm:justify-start w-full sm:w-20 h-20 sm:h-full px-4 py-2 sm:py-12 sm:px-0 gap-2 sm:gap-6 shrink-0 border-t sm:border-t-0 sm:border-r border-neon-500/10 bg-surface-900/60 backdrop-blur-xl shadow-2xl safe-area-nav">
         <div className="hidden sm:flex items-center justify-center mb-4 mt-2">
           <Logo size="md" animated />
         </div>
@@ -412,7 +445,7 @@ function App() {
       </nav>
 
       {/* Main Content */}
-      <main className="relative z-10 flex-[1_1_100%] overflow-hidden flex flex-col">
+      <main className="relative z-10 flex-[1_1_100%] overflow-hidden flex flex-col safe-area-content">
         {view === "home" && (
           <HomeFeed stories={stories} onStoryClick={setActiveStory} onGenerate={handleGenerateStory} isGenerating={isGenerating}
             onDeleteStory={handleDeleteStory} onTogglePin={handleTogglePin} onToggleFavorite={handleToggleFavorite}

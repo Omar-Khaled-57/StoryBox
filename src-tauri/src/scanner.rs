@@ -10,7 +10,6 @@ use sqlx::{Pool, Sqlite};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc::Sender;
 use walkdir::WalkDir;
-use directories::UserDirs;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -247,14 +246,14 @@ pub async fn scan_directory(dir: &Path, tx: &Sender<IndexingJob>, state: Arc<Pro
                 if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                     let ext_lower = ext.to_lowercase();
                     if matches!(ext_lower.as_str(), "jpg" | "jpeg" | "png" | "webp") {
-                        // Increment total BEFORE blocking send so the UI "Found" count goes up immediately
-                        scan_state.total_found.fetch_add(1, Ordering::Relaxed);
-                        local_count += 1;
-
                         if let Err(e) = tx.blocking_send(IndexingJob {
                             path: path.to_path_buf(),
                         }) {
                             eprintln!("Failed to send indexing job: {}", e);
+                        } else {
+                            // Only count if the job was actually queued
+                            scan_state.total_found.fetch_add(1, Ordering::Relaxed);
+                            local_count += 1;
                         }
                     }
                 }
@@ -303,6 +302,7 @@ async fn desktop_scan(
     handle: &tauri::AppHandle,
     pool: Option<&Pool<Sqlite>>,
 ) -> Result<usize, String> {
+    use directories::UserDirs;
     use tauri::Emitter;
     let mut total_count = 0;
     let mut search_paths = Vec::new();
@@ -392,10 +392,10 @@ async fn desktop_scan(
 ///
 /// On mobile targets, delegates scanning to the frontend via a trigger-mobile-scan event.
 pub async fn internal_scan_device(
-    tx: &Sender<IndexingJob>,
-    proc_state: Arc<ProcessingState>,
+    _tx: &Sender<IndexingJob>,
+    _proc_state: Arc<ProcessingState>,
     handle: &tauri::AppHandle,
-    pool: Option<&Pool<Sqlite>>,
+    _pool: Option<&Pool<Sqlite>>,
 ) -> Result<usize, String> {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
@@ -405,5 +405,5 @@ pub async fn internal_scan_device(
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    desktop_scan(tx, proc_state, handle, pool).await
+    desktop_scan(_tx, _proc_state, handle, _pool).await
 }

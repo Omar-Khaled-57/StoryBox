@@ -1,6 +1,6 @@
 [package]
 name = "storybox3"
-version = "3.0.1"
+version = "3.0.2"
 description = "AI-powered photo storytelling app — powered by OpenRouter"
 authors = ["StoryBox Team"]
 edition = "2021"
@@ -36,8 +36,6 @@ rand = "0.8.5"
 tauri-plugin-fs = "2"
 base64 = "0.22.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tauri-plugin-medialibrary = "0.14.0"
-
-[target.'cfg(target_os = "ios")'.dependencies]
-tauri-plugin-ios-photos = "0.3"
+notify = { version = "7", features = [] }
+lru = "0.12"
 

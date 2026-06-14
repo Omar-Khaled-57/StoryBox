@@ -107,7 +107,7 @@ export default function StoryViewer({ story, onClose }: StoryViewerProps) {
     : null;
 
   return (
-    <div className="fixed inset-0 z-[1000] flex items-center justify-center bg-surface-950/98 backdrop-blur-md animate-fade-in" onContextMenu={(e) => e.preventDefault()}>
+    <div className="fixed inset-0 z-[1000] flex items-center justify-center bg-surface-950/98 backdrop-blur-md animate-fade-in safe-area-content" onContextMenu={(e) => e.preventDefault()}>
       <div className="relative w-full h-full max-w-md overflow-hidden bg-surface-950 flex flex-col shadow-2xl sm:rounded-3xl sm:h-[92vh] sm:border sm:border-neon-500/20">
         {/* Cyber scanline overlay */}
         <div className="cyber-scanline z-[3] pointer-events-none transition-opacity duration-500" style={{ opacity: uiHidden ? 0 : 1 }} />

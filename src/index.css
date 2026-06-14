@@ -2,6 +2,16 @@
 @tailwind components;
 @tailwind utilities;
 
+.safe-area-nav {
+  padding-bottom: calc(env(safe-area-inset-bottom, 1.25rem) + 0.75rem);
+  padding-top: calc(env(safe-area-inset-top, 0px) + 0.5rem);
+}
+
+.safe-area-content {
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
 @layer base {
   :root {
     --bg-primary: #05080c;

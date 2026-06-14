@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Story, AiHealthStatus } from "../App";
 import { PlusIcon, CameraIcon, HeartIcon } from "./Icons";
@@ -22,7 +22,7 @@ function formatDate(dateStr: string | null): string {
   catch { return dateStr; }
 }
 
-export default function HomeFeed({
+function HomeFeed({
   stories, onStoryClick, onGenerate, isGenerating, onDeleteStory, onTogglePin, onToggleFavorite,
   aiHealth, onNavigateToSettings, title = "StoryBox3"
 }: HomeFeedProps) {
@@ -32,22 +32,22 @@ export default function HomeFeed({
   const [scrollLeft, setScrollLeft] = useState(0);
   const [dragged, setDragged] = useState(false);
 
-  const handleMouseDown = (e: React.MouseEvent) => {
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if (!scrollRef.current) return;
     setIsDragging(true); setDragged(false);
     setStartX(e.pageX - scrollRef.current.offsetLeft);
     setScrollLeft(scrollRef.current.scrollLeft);
-  };
-  const handleMouseUp = () => setIsDragging(false);
-  const handleMouseLeave = () => setIsDragging(false);
-  const handleMouseMove = (e: React.MouseEvent) => {
+  }, []);
+  const handleMouseUp = useCallback(() => setIsDragging(false), []);
+  const handleMouseLeave = useCallback(() => setIsDragging(false), []);
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
     if (!isDragging || !scrollRef.current) return;
     e.preventDefault();
     const x = e.pageX - scrollRef.current.offsetLeft;
     const walk = (x - startX) * 2;
     if (Math.abs(x - startX) > 5) setDragged(true);
     scrollRef.current.scrollLeft = scrollLeft - walk;
-  };
+  }, [isDragging, startX, scrollLeft]);
 
   return (
     <div className="flex flex-col gap-10 p-10 h-full overflow-y-auto overflow-x-hidden w-full">
@@ -126,7 +126,7 @@ export default function HomeFeed({
   );
 }
 
-function StoryCard({ story, onClick, onDelete, onTogglePin, onToggleFavorite }: {
+const StoryCard = memo(function StoryCard({ story, onClick, onDelete, onTogglePin, onToggleFavorite }: {
   story: Story; onClick: () => void; onDelete: () => void; onTogglePin: () => void; onToggleFavorite: () => void;
 }) {
   const firstImage = story.images[0];
@@ -134,21 +134,35 @@ function StoryCard({ story, onClick, onDelete, onTogglePin, onToggleFavorite }: 
   const [imgSrc, setImgSrc] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuClosing, setMenuClosing] = useState(false);
+  const [isVisible, setIsVisible] = useState(false);
+  const cardRef = useRef<HTMLDivElement>(null);
 
-  const closeMenu = () => {
+  const closeMenu = useCallback(() => {
     if (!menuOpen) return;
     setMenuClosing(true);
     setTimeout(() => { setMenuClosing(false); setMenuOpen(false); }, 200);
-  };
+  }, [menuOpen]);
+
+  // Lazy load thumbnail via IntersectionObserver
+  useEffect(() => {
+    const el = cardRef.current;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => { if (entry.isIntersecting) { setIsVisible(true); observer.disconnect(); } },
+      { rootMargin: "200px" }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
-    if (firstImage) {
+    if (firstImage && isVisible && !imgSrc) {
       invoke<string>("get_cached_image_base64", { id: firstImage.id, imageType: "thumb" }).then(setImgSrc).catch(console.error);
     }
-  }, [firstImage]);
+  }, [firstImage, isVisible, imgSrc]);
 
   return (
-    <div className="animated-border-wrap min-w-[280px] max-w-[280px] h-[440px] shrink-0 snap-center cursor-pointer transition-all duration-500 ease-out hover:-translate-y-2 hover:shadow-neon-500/20 group"
+    <div ref={cardRef} className="animated-border-wrap min-w-[280px] max-w-[280px] h-[440px] shrink-0 snap-center cursor-pointer transition-all duration-500 ease-out hover:-translate-y-2 hover:shadow-neon-500/20 group"
       onClick={onClick} role="button" tabIndex={0} onKeyDown={(e) => e.key === "Enter" && onClick()}>
       <div className="animated-border-inner bg-surface-800 shadow-lg">
         <div className="absolute inset-0 transition-transform duration-700 group-hover:scale-105">
@@ -224,6 +238,6 @@ function StoryCard({ story, onClick, onDelete, onTogglePin, onToggleFavorite }: 
     </div>
     </div>
   );
-}
+});
 
-
+export default HomeFeed;

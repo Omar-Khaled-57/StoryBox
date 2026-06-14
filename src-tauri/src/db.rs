@@ -159,5 +159,20 @@ async fn create_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Performance indexes for common query patterns
+    // These use IF NOT EXISTS so they are safe on existing databases
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_images_ai_analyzed ON images(ai_analyzed)")
+        .execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_story_images_story_id ON story_images(story_id)")
+        .execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_story_images_image_id ON story_images(image_id)")
+        .execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_stories_is_pinned_created ON stories(is_pinned, created_at)")
+        .execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_images_path ON images(path)")
+        .execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_scanned_folders_is_enabled ON scanned_folders(is_enabled)")
+        .execute(pool).await;
+
     Ok(())
 }

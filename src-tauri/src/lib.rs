@@ -1,8 +1,10 @@
 pub mod ai;
+pub mod cache;
 pub mod db;
 pub mod processor;
 pub mod scanner;
 pub mod stories;
+pub mod watcher;
 
 /// Tauri application entry point and command registration.
 ///
@@ -12,11 +14,11 @@ pub mod stories;
 /// - Starts background workers (processing pipeline, automation loop)
 /// - Handles app lifecycle (setup, reset)
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tauri::{Manager, Emitter};
 use tokio::sync::mpsc;
 use sqlx::Pool;
 use sqlx::sqlite::Sqlite;
-use std::sync::atomic::Ordering;
 
 #[tauri::command]
 async fn check_ai_availability(
@@ -102,9 +104,8 @@ async fn test_ai_generation(
     }))
 }
 
-/// Accepts base64-encoded image data (from iOS Photos plugin), writes to a
-/// temp file, and queues it for indexing. Works cross-platform but is mainly
-/// used on iOS where the medialibrary plugin is unavailable.
+/// Accepts base64-encoded image data (from mobile SAF/folder picker), writes
+/// to a temp file, and queues it for indexing. Cross-platform mobile scanning.
 #[tauri::command]
 async fn index_ios_image_data(
     data: String,
@@ -118,10 +119,10 @@ async fn index_ios_image_data(
     std::fs::create_dir_all(&temp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
     let file_path = temp_dir.join(&file_name);
     std::fs::write(&file_path, &bytes).map_err(|e| format!("Failed to write temp file: {}", e))?;
-    state.total_found.fetch_add(1, Ordering::Relaxed);
     indexing_tx
         .send(processor::IndexingJob { path: file_path })
         .await
+        .map(|_| state.total_found.fetch_add(1, Ordering::Relaxed))
         .map_err(|e| format!("Failed to queue iOS image: {}", e))?;
     Ok(())
 }
@@ -159,19 +160,15 @@ async fn reset_app(app_handle: tauri::AppHandle) -> Result<(), String> {
 pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_medialibrary::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init());
-
-    #[cfg(target_os = "ios")]
-    let builder = builder.plugin(tauri_plugin_ios_photos::init());
 
     builder
         .setup(|app| {
             let handle = app.handle().clone();
 
             // Set up our job queue
-            let (tx, rx) = mpsc::channel::<processor::IndexingJob>(100);
+            let (tx, rx) = mpsc::channel::<processor::IndexingJob>(256);
             app.manage(tx.clone());
 
             let app_data_dir = handle.path().app_local_data_dir().expect("requires app local data dir");
@@ -179,6 +176,11 @@ pub fn run() {
             tauri::async_runtime::block_on(async move {
                 let pool = db::init_db(&handle).await.expect("DB init");
                 handle.manage(pool.clone());
+
+                // In-memory image cache — loaded from DB once at startup
+                let image_cache = Arc::new(cache::ImageCache::new());
+                image_cache.load_from_db(&pool).await;
+                handle.manage(image_cache.clone());
                 
                 // Processing State
                 let proc_state = Arc::new(processor::ProcessingState::default());
@@ -188,40 +190,44 @@ pub fn run() {
                 let ai_engine = Arc::new(ai::AIEngine::new(&app_data_dir).unwrap_or_default());
                 handle.manage(ai_engine.clone());
 
-                // Worker
+                // Processing worker
                 tokio::spawn(processor::start_processing_worker(
                     rx, 
                     pool.clone(), 
-                    app_data_dir, 
+                    app_data_dir.clone(), 
                     ai_engine.clone(), 
                     handle.clone(), 
                     proc_state.clone()
                 ));
 
-                // Startup scan — use persisted folders + device defaults
+                // File system watcher — monitors scanned folders for new/deleted files
+                // Only available on desktop platforms (notify doesn't support mobile)
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                {
+                    let watcher_pool = pool.clone();
+                    let watcher_tx = tx.clone();
+                    let watcher_state = proc_state.clone();
+                    let _ = watcher::FolderWatcher::start(watcher_pool, watcher_tx, watcher_state).await;
+                }
+
+                // On startup: load image count from DB, emit scan-complete, trigger stories refresh
+                let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM images")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap_or((0,));
+                let _ = handle.emit("scan-complete", count.0 as usize);
+
+                // Background device scan — discover default folders, persist them, scan new ones
                 let tx_scan = tx.clone();
                 let handle_scan = handle.clone();
                 let proc_state_scan = proc_state.clone();
                 let pool_scan = pool.clone();
+                let cache_scan = image_cache.clone();
                 tokio::spawn(async move {
                     let _ = scanner::internal_scan_device(&tx_scan, proc_state_scan, &handle_scan, Some(&pool_scan)).await;
-                });
-
-                // Onboarding stories
-                let onboarding_pool = pool.clone();
-                let onboarding_handle = handle.clone();
-                tokio::spawn(async move {
-                    // Wait for some images to be indexed before generating stories
-                    for _ in 0..10 {
-                        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM images")
-                            .fetch_one(&onboarding_pool)
-                            .await
-                            .unwrap_or((0,));
-                        if count.0 >= 5 { break; }
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
-
-                    let _ = onboarding_handle.emit("refresh-stories", ());
+                    // Refresh cache after scanning completes
+                    cache_scan.load_from_db(&pool_scan).await;
+                    let _ = handle_scan.emit("refresh-stories", ());
                 });
 
                 // Periodic automation: story generation + cleanup every 30 minutes

@@ -145,32 +145,32 @@ pub async fn generate_random_story(pool: &Pool<Sqlite>) -> Result<Option<Story>>
         return Ok(None);
     }
 
-    // Pull AI features for each image
+    // Pull AI features for all images in one batch query
+    let ids: Vec<String> = images.iter().map(|(id, _, _, _)| format!("'{}'", id)).collect();
+    let features_rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        &format!("SELECT image_id, tags, vibe FROM image_features WHERE image_id IN ({})", ids.join(","))
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut features_map: std::collections::HashMap<String, (Option<String>, Option<String>)> = std::collections::HashMap::new();
+    for (img_id, tags_json, vibe) in features_rows {
+        features_map.insert(img_id, (tags_json, vibe));
+    }
+
     let mut story_images: Vec<ImageRecord> = Vec::new();
     let mut all_tags: Vec<String> = Vec::new();
     let mut last_vibe: Option<String> = None;
 
     for (id, path, date_taken, ai_analyzed) in images {
-        let features: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT tags, vibe FROM image_features WHERE image_id = ?"
-        )
-        .bind(&id)
-        .fetch_optional(pool)
-        .await?;
-
-        let (tags, vibe) = if let Some((tags_json, vibe)) = features {
-            let parsed_tags: Vec<String> = tags_json
-                .as_deref()
-                .and_then(|j| serde_json::from_str(j).ok())
-                .unwrap_or_default();
-            all_tags.extend(parsed_tags.clone());
-            if vibe.is_some() { last_vibe = vibe.clone(); }
-            (Some(parsed_tags), vibe)
-        } else {
-            (None, None)
-        };
-
-        story_images.push(ImageRecord { id, path, date_taken, ai_analyzed, tags, vibe });
+        let (tags_json, vibe) = features_map.remove(&id).unwrap_or((None, None));
+        let parsed_tags: Vec<String> = tags_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default();
+        all_tags.extend(parsed_tags.clone());
+        if vibe.is_some() { last_vibe = vibe.clone(); }
+        story_images.push(ImageRecord { id, path, date_taken, ai_analyzed, tags: Some(parsed_tags), vibe });
     }
 
     let caption = build_caption(&all_tags, last_vibe.as_deref(), None);
@@ -316,25 +316,32 @@ pub async fn generate_ai_story(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> R
     }
     let selected_ids = &final_ids[..final_ids.len().min(8)];
 
-    // 4. Build story images and collect context for AI
+    // 4. Build story images and collect context for AI — batched queries
+    let ids_str: Vec<String> = selected_ids.iter().map(|id| format!("'{}'", id)).collect();
+    let id_list = ids_str.join(",");
+
+    let img_rows: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
+        &format!("SELECT id, path, date_taken, ai_analyzed FROM images WHERE id IN ({})", id_list)
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let feat_rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        &format!("SELECT image_id, tags, dominant_color, vibe FROM image_features WHERE image_id IN ({})", id_list)
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let feat_map: std::collections::HashMap<String, (Option<String>, Option<String>, Option<String>)> =
+        feat_rows.into_iter().map(|(id, t, c, v)| (id, (t, c, v))).collect();
+
     let mut story_images = Vec::new();
     let mut all_tags = Vec::new();
     let mut last_vibe = None;
     let mut local_color_counts = std::collections::HashMap::new();
 
-    for img_id in selected_ids {
-        let (path, date_taken, ai_analyzed): (String, Option<String>, bool) = 
-            sqlx::query_as("SELECT path, date_taken, ai_analyzed FROM images WHERE id = ?")
-                .bind(img_id)
-                .fetch_one(pool)
-                .await?;
-
-        let (tags_json, color_hex, vibe): (Option<String>, Option<String>, Option<String>) = 
-            sqlx::query_as("SELECT tags, dominant_color, vibe FROM image_features WHERE image_id = ?")
-                .bind(img_id)
-                .fetch_one(pool)
-                .await?;
-        
+    for (img_id, path, date_taken, ai_analyzed) in img_rows {
+        let (tags_json, color_hex, vibe) = feat_map.get(&img_id).cloned().unwrap_or((None, None, None));
         let tags = parse_tags(tags_json);
         all_tags.extend(tags.clone());
         if vibe.is_some() { last_vibe = vibe.clone(); }
@@ -343,7 +350,7 @@ pub async fn generate_ai_story(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> R
         }
 
         story_images.push(ImageRecord {
-            id: img_id.clone(),
+            id: img_id,
             path,
             date_taken,
             ai_analyzed,
@@ -422,59 +429,63 @@ pub async fn generate_ai_story(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> R
     }))
 }
 
-/// Fetch all stories with their images
-/// Fetches all stories ordered by pinned status and creation date, with their images.
+/// Fetch all stories with their images — uses a single JOIN query (O(1) DB round-trips).
 pub async fn get_all_stories(pool: &Pool<Sqlite>) -> Result<Vec<Story>> {
-    let story_rows: Vec<(String, String, String, String, bool, bool)> = sqlx::query_as(
-        "SELECT id, theme_type, COALESCE(caption, ''), created_at, is_favorite, is_pinned FROM stories ORDER BY is_pinned DESC, created_at DESC LIMIT 20"
+    // Single query: stories → story_images → images → image_features in one JOIN
+    let rows: Vec<(String, String, String, String, bool, bool, String, String, Option<String>, bool, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT s.id, s.theme_type, COALESCE(s.caption, ''), s.created_at,
+                s.is_favorite, s.is_pinned,
+                i.id, i.path, i.date_taken, i.ai_analyzed,
+                f.tags, f.vibe
+         FROM stories s
+         JOIN story_images si ON si.story_id = s.id
+         JOIN images i ON i.id = si.image_id
+         LEFT JOIN image_features f ON f.image_id = i.id
+         ORDER BY s.is_pinned DESC, s.created_at DESC, si.sequence_order
+         LIMIT 200"
     )
     .fetch_all(pool)
     .await?;
 
-    let mut stories = Vec::new();
+    let mut stories: Vec<Story> = Vec::new();
 
-    for (story_id, theme_type, caption, created_at, is_favorite, is_pinned) in story_rows {
-        let images: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
-            "SELECT i.id, i.path, i.date_taken, i.ai_analyzed FROM images i
-             JOIN story_images si ON si.image_id = i.id
-             WHERE si.story_id = ?
-             ORDER BY si.sequence_order",
-        )
-        .bind(&story_id)
-        .fetch_all(pool)
-        .await?;
+    for (s_id, theme_type, caption, created_at, is_favorite, is_pinned,
+         i_id, i_path, i_date_taken, i_ai_analyzed, tags_json, vibe) in rows {
 
-        let mut story_images: Vec<ImageRecord> = Vec::new();
-        for (id, path, date_taken, ai_analyzed) in images {
-            let features: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-                "SELECT tags, vibe FROM image_features WHERE image_id = ?"
-            )
-            .bind(&id)
-            .fetch_optional(pool)
-            .await?;
+        let story = stories.last_mut().and_then(|s| if s.id == s_id { Some(s) } else { None });
 
-            let (tags, vibe) = if let Some((tags_json, vibe)) = features {
-                let parsed_tags: Vec<String> = tags_json
-                    .as_deref()
-                    .and_then(|j| serde_json::from_str(j).ok())
-                    .unwrap_or_default();
-                (Some(parsed_tags), vibe)
-            } else {
-                (None, None)
-            };
+        let tags: Vec<String> = tags_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default();
 
-            story_images.push(ImageRecord { id, path, date_taken, ai_analyzed, tags, vibe });
+        if let Some(story) = story {
+            story.images.push(ImageRecord {
+                id: i_id,
+                path: i_path,
+                date_taken: i_date_taken,
+                ai_analyzed: i_ai_analyzed,
+                tags: Some(tags),
+                vibe,
+            });
+        } else {
+            stories.push(Story {
+                id: s_id,
+                theme_type,
+                caption,
+                created_at,
+                images: vec![ImageRecord {
+                    id: i_id,
+                    path: i_path,
+                    date_taken: i_date_taken,
+                    ai_analyzed: i_ai_analyzed,
+                    tags: Some(tags),
+                    vibe,
+                }],
+                is_favorite,
+                is_pinned,
+            });
         }
-
-        stories.push(Story {
-            id: story_id,
-            theme_type,
-            caption,
-            created_at,
-            images: story_images,
-            is_favorite,
-            is_pinned,
-        });
     }
 
     Ok(stories)
@@ -590,15 +601,13 @@ pub async fn get_ai_status(
     state: tauri::State<'_, Pool<Sqlite>>,
     proc_state: tauri::State<'_, Arc<ProcessingState>>
 ) -> Result<AiStatus, String> {
-    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM images")
+    let counts: (i64, i64) = sqlx::query_as("SELECT COUNT(*) as total, COALESCE(SUM(ai_analyzed), 0) as analyzed FROM images")
         .fetch_one(&*state)
         .await
         .map_err(|e| e.to_string())?;
 
-    let analyzed: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM images WHERE ai_analyzed = 1")
-        .fetch_one(&*state)
-        .await
-        .map_err(|e| e.to_string())?;
+    let total = counts.0;
+    let analyzed = counts.1;
 
     let settings: (String, String, String) = sqlx::query_as("SELECT provider, model_name, proxy_url FROM ai_settings WHERE id = 1")
         .fetch_one(&*state)
@@ -619,9 +628,9 @@ pub async fn get_ai_status(
     };
 
     Ok(AiStatus {
-        total_images: total.0,
-        analyzed_images: analyzed.0,
-        pending_images: total.0 - analyzed.0,
+        total_images: total,
+        analyzed_images: analyzed,
+        pending_images: total - analyzed,
         is_mock,
         engine_name,
         is_indexing_paused: proc_state.stop_indexing.load(Ordering::Relaxed),
@@ -733,18 +742,15 @@ pub async fn run_automation_tasks(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -
         let expiry = now - chrono::Duration::hours(24);
         let expiry_str = expiry.to_rfc3339();
 
-        // Find stories to delete
-        let expired_ids: Vec<(String,)> = sqlx::query_as(
-            "SELECT id FROM stories WHERE is_pinned = 0 AND created_at < ?"
-        )
-        .bind(&expiry_str)
-        .fetch_all(pool)
-        .await?;
-
-        for (id,) in expired_ids {
-            sqlx::query("DELETE FROM story_images WHERE story_id = ?").bind(&id).execute(pool).await?;
-            sqlx::query("DELETE FROM stories WHERE id = ?").bind(&id).execute(pool).await?;
-        }
+        // Batch delete expired stories
+        sqlx::query("DELETE FROM story_images WHERE story_id IN (SELECT id FROM stories WHERE is_pinned = 0 AND created_at < ?)")
+            .bind(&expiry_str)
+            .execute(pool)
+            .await?;
+        sqlx::query("DELETE FROM stories WHERE is_pinned = 0 AND created_at < ?")
+            .bind(&expiry_str)
+            .execute(pool)
+            .await?;
 
         sqlx::query("UPDATE ai_settings SET last_cleanup_at = ? WHERE id = 1")
             .bind(now.to_rfc3339())
