@@ -300,7 +300,7 @@ export default function SettingsPanel({
 
         <Section icon={<InfoIcon />} title="App Information" description="Technical details.">
           <div className="flex flex-col rounded-2xl border border-neon-500/10 overflow-hidden bg-surface-900/40">
-            <ManifestRow label="Version" value="3.0.1" />
+            <ManifestRow label="Version" value="3.1.0" />
             <ManifestRow label="Architecture" value="Tauri 2 · React · Rust" />
             <ManifestRow label="AI Provider" value="OpenRouter (Cloud)" />
             <ManifestRow label="Backend DB" value="SQLite via sqlx" />

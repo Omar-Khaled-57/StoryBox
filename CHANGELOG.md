@@ -4,6 +4,131 @@ A running log of every change, fix, and decision during development. Newest entr
 
 ---
 
+## v3.1.0 — Pipeline, Intelligence & Production Polish · 2025-06-15
+
+**Focus**: Production-grade two-stage processing pipeline, architectural modularization, AI intelligence upgrades, and comprehensive UI/UX refinement.
+
+### 🚀 Architecture & Modularization
+
+- **Two-stage processing pipeline** (`processor.rs`) — image indexing and AI analysis now run as independent semaphore-throttled workers connected by bounded channels. Indexing uses `num_cpus - 1` permits; analysis uses `max(2, num_cpus / 4)`.
+- **Dynamic resource shifting** — when indexing reaches 90% completion, capacity is transferred from indexing to analysis via `compare_exchange` semantics, maximizing throughput without starving either stage.
+- **`ImageCache`** (`cache.rs`) — LRU in-memory cache (10,000 entries desktop / 2,500 mobile) populated from DB at startup. Eliminates repetitive DB reads during story generation. Atomic counters for total/analyzed counts.
+- **`FolderWatcher`** (`watcher.rs`) — `notify`-based recursive watcher for all enabled scanned folders. Automatically queues newly created or modified image files into the indexing pipeline. Desktop-only via `#[cfg]`.
+- **`exif.rs`** — dedicated EXIF extraction module for `DateTimeOriginal`, GPS latitude/longitude, with graceful fallback across timestamp formats.
+- **Custom React hooks** — logic extracted from `App.tsx` into 5 focused hooks: `useStories` (CRUD + pin/favorite), `useScan` (scan lifecycle), `useScannedFolders` (folder + child management), `useAiHealth` (30s polling), `useActivities` (activity tracking with auto-incrementing IDs).
+- **Centralized `Icons.tsx`** — 16 named SVG icon components replacing inline markup, with consistent viewBox and stroke styling.
+- **Benchmark harness** (`bin/bench.rs`) — standalone binary for synthetic performance testing of thumbnail generation, pixel sampling, EXIF extraction, resize filters, and DB throughput.
+
+### 🤖 AI Intelligence
+
+- **Structured vision prompt** — replaced ad-hoc one-liner with a multi-rule prompt enforcing 5 objective tags, a single-word vibe, and explicit prohibitions on full sentences, abstractions, repeated tags, and brand names (both OpenRouter and Ollama variants).
+- **Enhanced caption prompt** — "cinematic photo story title" prompt requiring 3–5 natural words, forbidding clichés, hashtags, and punctuation overload.
+- **Background caption enrichment** — after `generate_ai_story` persists a template caption, a background async task queries the AI provider for a polished caption, updates the DB, and emits `story-updated` to the frontend.
+- **`Storyteller` struct** — encapsulates provider selection, URL construction, and API key/proxy routing for caption generation.
+- **Unified `check_ai_availability`** — pings OpenRouter (proxy or direct), Ollama (`/api/tags`), or always-available Mock, returning structured availability with model-loaded flags.
+- **`test_ai_generation`** — end-to-end diagnostic: picks a real image from DB, runs vision analysis, generates caption, returns full result for debugging.
+
+### 🔧 Indexing & Analysis
+
+- **Pause / Resume** — independent `stop_indexing`/`resume_indexing` and `stop_analysis`/`resume_analysis` commands. Workers use `tokio::sync::Notify` for zero-CPU waiting while paused.
+- **Skip-detection** — on re-scan, compares `file_size + file_modified` to skip unchanged files. Partial re-indexing when metadata changes.
+- **30-second per-image timeout** — slow or corrupted files emit `indexing-status` with `"skipped"` and continue without blocking the pipeline.
+- **Junk reanalysis** — `trigger_junk_reanalysis` re-queues images with garbled/missing AI tags in batches of 100, regenerates thumbnails and re-runs analysis.
+- **Priority-aware UI status** — `get_ai_status` surfaces `is_indexing_paused`, `is_analysis_paused`, `total_found`, `indexed_count` for real-time control panel feedback.
+
+### 📚 Stories Engine
+
+- **Two-path generation** — `generate_story` tries AI story first (45s timeout), falls back to template-generated random story automatically.
+- **Date & tag clustering** — AI story builder groups images by date cluster (3+ same-day) or top tag frequency, picks up to 8 images with shuffle randomization.
+- **Pin to Top** — `toggle_story_pin` flips pinned state; story feed sorts pinned stories first, then by `created_at` descending.
+- **Favorites** — `toggle_story_favorite` with dedicated "Favorites" view in the sidebar. Heart icon badge on favorited cards.
+- **Auto-generation** — configurable interval (default 12h) via `auto_gen_interval_hours`. Background loop checks every 30 minutes.
+- **Auto-cleanup** — configurable expiration (default 24h) via `cleanup_interval_hours`. Batch-deletes unpinned stories older than the threshold.
+- **Paginated feed** — `get_stories` supports `LIMIT`/`OFFSET` parameters (default 200/0).
+- **`build_caption` template engine** — 12 caption templates keyed to tag frequency and color-vibe mapping (8 named vibes from hex colors).
+
+### 🗄️ Database
+
+- **Complete schema** — 7 tables: `images`, `image_features`, `stories`, `story_images`, `ai_settings`, `scanned_folders`, `folder_child_overrides` with foreign keys and composite primary keys.
+- **WAL mode + 64 MB cache** — `PRAGMA journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000` for reliable concurrent access.
+- **7 indexes** — on `ai_analyzed`, `file_size+file_modified`, `date_taken`, `story_id`, `image_id`, `is_pinned+created_at`, `path`, `is_enabled`.
+- **Graceful migrations** — `ALTER TABLE ADD COLUMN` with error suppression for incremental schema evolution (`embedding`, `is_favorite`, `is_pinned`, `vision_model_name`, proxy/interval columns).
+- **`folder_child_overrides`** — composite primary key `(parent_path, child_name)` for per-subfolder disable state.
+
+### 🎨 UI / UX
+
+- **ActivityIndicator with pause states** — button shows spinning progress, amber indexing-paused badge, green analysis-paused badge, or combined blue pause icon. Popup displays per-item status messages with pause overlays on progress bars.
+- **Activity status panel** — real-time progress bars, pause/resume toggles, "Flash Indexing" vs "AI Queue" labels, and engine info in Settings.
+- **Toast notifications** — fixed top-center toast with success/error/info variants, 4-second auto-dismiss, scale-in animation and backdrop blur.
+- **Folder accessibility detection** — `check_folders_accessibility` verifies folder existence on disk; UI shows amber warning banner counting inaccessible folders and red "Missing" badges.
+- **Safe area / notch support** — CSS `env(safe-area-inset-*)` applied to nav and content containers via `safe-area-nav` and `safe-area-content` classes.
+- **PWA manifest** — `manifest.json` with standalone display, 3 icon sizes (192, 512, 484), theme color `#0a0a1a`, categories `photography`/`entertainment`/`lifestyle`.
+- **Apple touch / mobile web** — `apple-mobile-web-app-capable`, `viewport-fit=cover`, `apple-touch-icon`, safe-area CSS variables.
+- **Lazy image loading** — `IntersectionObserver` with 200px root margin defers thumbnail loading until cards enter the viewport.
+- **Drag-to-scroll** — horizontal story cards container with `cursor-grab`/`cursor-grabbing` states.
+- **Full-screen story viewer** — auto-advancing slideshow (5s per image), animated progress bars, tap zones for prev/next (40%/60%), press-and-hold to hide UI, keyboard arrows + Escape, full-view image mode.
+- **Subfolder management UI** — expandable folder rows with individual child toggles and optimistic UI updates.
+- **Story card animations** — animated gradient border (`gradientBorder` 4s infinite), hover lift, image scale, glow intensification. Cyber background with animated grid, 12 floating particles, and CRT scanline overlay.
+
+### ⚡ Performance
+
+- **LRU image cache** — 10,000 entries desktop / 2,500 mobile, avoids repeated DB reads and thumbnail regeneration.
+- **Pixel sampling for dominant color** — every-5th-pixel sampling (claimed 96% faster than full scan).
+- **Two-stage thumbnail generation** — 1080px display image first, then 500px thumbnail from display (avoids double decode). JPEG quality 85.
+- **Bounded channels** — indexing channel capacity 256, analysis channel capacity 200.
+- **Atomic counters** — `total_found`, `indexed_count`, `stop_indexing`, `stop_analysis` use relaxed `AtomicUsize`/`AtomicBool` — no mutex contention.
+- **Early memory release** — explicit `drop(img)` after thumbnail generation frees decoded image buffers.
+- **`spawn_blocking` for I/O** — all blocking operations (decode, EXIF, file writes) offloaded to Tokio's blocking thread pool.
+- **`yield_now()` during directory scan** — prevents async runtime starvation on large folders (every 1000 entries).
+
+### 📱 Mobile
+
+- **SAF-based scanning** — replaces unreliable `@universalappfactory/tauri-plugin-medialibrary` and `@gbyte/tauri-plugin-ios-photos` with `tauri-plugin-dialog` (folder picker) + `tauri-plugin-fs` (`readDir`/`readFile`).
+- **Base64 image ingestion** — `index_ios_image_data` accepts base64-encoded image data from mobile JS, writes to temporary directory, queues for indexing.
+- **`#[cfg]` platform gating** — `FolderWatcher` desktop-only; mobile `internal_scan_device` emits `trigger-mobile-scan` event; cache capacity reduced on mobile.
+- **iOS capability scoping** — `ios-photos:default` removed; `fs:default` with `$APPDATA`, `$HOME`, `$PICTURE`, `$DOWNLOAD`, `$DOCUMENT`, `$TEMP` paths in `capabilities/default.json`.
+
+### 🧪 Reliability & Error Handling
+
+- **Graceful degradation** — story generation falls back AI → template → random. Image analysis errors logged but never crash the worker. AI availability check never panics.
+- **Lock poisoning recovery** — `Mutex` on cache uses `.unwrap_or_else(|e| e.into_inner())`. `RwLock` on settings propagates with `.map_err`.
+- **Configurable timeouts** — vision API 60s (OpenRouter) / 90s (Ollama), caption 30s, per-image indexing 30s, story generation 45s.
+- **`INSERT OR IGNORE`** — deduplication for image features, story images, and scanned folders.
+
+### 🧹 Changes
+
+| File | What changed |
+|------|-------------|
+| `src-tauri/src/cache.rs` | **New** — `ImageCache` with `LRU`, atomic counters, DB load |
+| `src-tauri/src/watcher.rs` | **New** — `FolderWatcher` via `notify`, desktop-only |
+| `src-tauri/src/exif.rs` | **New** — EXIF date + GPS extraction |
+| `src-tauri/src/bin/bench.rs` | **New** — performance benchmark harness |
+| `src/components/Icons.tsx` | **New** — 16 named SVG icons |
+| `src/hooks/useStories.ts` | **New** — story CRUD + pin/favorite |
+| `src/hooks/useScan.ts` | **New** — scan lifecycle state |
+| `src/hooks/useScannedFolders.ts` | **New** — folder + child management |
+| `src/hooks/useAiHealth.ts` | **New** — 30s AI health polling |
+| `src/hooks/useActivities.ts` | **New** — activity tracking |
+| `src/index.css` | **New** — design system + cyber effects |
+| `public/manifest.json` | **New** — PWA manifest with icons |
+| `src-tauri/src/processor.rs` | Rewritten two-stage pipeline, pause/resume, semaphore scaling |
+| `src-tauri/src/stories.rs` | AI + template generation, pin, favorite, enrichment, automation |
+| `src-tauri/src/ai.rs` | Structured vision/caption prompts, Storyteller, availability check |
+| `src-tauri/src/db.rs` | Full schema, WAL, 7 indexes, migrations, child overrides table |
+| `src-tauri/src/scanner.rs` | Folder CRUD, accessibility check, mobile path gating |
+| `src-tauri/src/lib.rs` | Cache/watcher/worker integration, automation loop, 35 commands |
+| `src/App.tsx` | Hook-based refactor, pause state polling, mobile SAF scanning |
+| `src/components/ActivityIndicator.tsx` | Pause badges, status messages, portal popup |
+| `src/components/HomeFeed.tsx` | Memoized cards, lazy loading, drag-scroll, context menu |
+| `src/components/StoryViewer.tsx` | Auto-advance, progress bars, tap/keys, full-view mode |
+| `src/components/SettingsPanel.tsx` | Sections, toasts, subfolder UI, pause controls |
+| `src-tauri/tauri.conf.json` | Schema v2, removed invalid `icon`, version 3.1.0 |
+| `src-tauri/Cargo.toml` | Added `notify`, `base64`, `lru`, `thiserror`, `kamadak-exif`, `tracing` |
+| `src-tauri/capabilities/default.json` | Scoped `fs:default` with allow paths |
+| `package.json` | Version 3.1.0 |
+
+---
+
 ## v3.0.2 — Architecture & Mobile Reliability · 2025-06-14
 
 **Focus**: Production‑ready architecture — in‑memory image cache, filesystem watcher, startup optimization, and reliable mobile file access via SAF + `tauri-plugin-fs`.
