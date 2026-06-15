@@ -58,7 +58,7 @@ impl ImageCache {
             .await
             .unwrap_or_default();
 
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.clear();
 
         let mut total = 0usize;
@@ -91,13 +91,13 @@ impl ImageCache {
     }
 
     pub fn get(&self, id: &str) -> Option<CachedImage> {
-        self.cache.lock().unwrap().get(id).cloned()
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
     }
 
     /// Returns `count` random analyzed images. Avoids cloning the entire cache.
     pub fn get_random_analyzed(&self, count: usize) -> Vec<CachedImage> {
         use rand::seq::SliceRandom;
-        let cache = self.cache.lock().unwrap();
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         // Collect analyzed entries only
         let analyzed: Vec<&CachedImage> = cache.iter().filter(|(_, img)| img.ai_analyzed).map(|(_, v)| v).collect();
         let mut rng = rand::thread_rng();
@@ -106,7 +106,7 @@ impl ImageCache {
     }
 
     pub fn insert(&self, image: CachedImage) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let added = cache.put(image.id.clone(), image);
         // If the entry already existed, don't double-count
         if added.is_none() {
@@ -116,7 +116,7 @@ impl ImageCache {
 
     /// Update the metadata for an existing entry (e.g. after AI analysis completes).
     pub fn update_analysis(&self, id: &str, tags: Vec<String>, vibe: Option<String>, dominant_color: Option<String>) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = cache.get_mut(id) {
             entry.ai_analyzed = true;
             entry.tags = tags;
@@ -127,7 +127,7 @@ impl ImageCache {
     }
 
     pub fn remove(&self, id: &str) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if cache.pop(id).is_some() {
             let old_total = self.total_count.fetch_sub(1, Ordering::Relaxed);
             let _ = old_total; // allow underflow only if bug

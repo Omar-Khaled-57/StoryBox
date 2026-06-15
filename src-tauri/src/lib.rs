@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod cache;
 pub mod db;
+pub mod exif;
 pub mod processor;
 pub mod scanner;
 pub mod stories;
@@ -14,6 +15,7 @@ pub mod watcher;
 /// - Starts background workers (processing pipeline, automation loop)
 /// - Handles app lifecycle (setup, reset)
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::Ordering;
 use tauri::{Manager, Emitter};
 use tokio::sync::mpsc;
@@ -22,24 +24,11 @@ use sqlx::sqlite::Sqlite;
 
 #[tauri::command]
 async fn check_ai_availability(
-    pool: tauri::State<'_, Pool<Sqlite>>,
     ai_engine: tauri::State<'_, Arc<ai::AIEngine>>,
+    ai_settings: tauri::State<'_, Arc<RwLock<ai::AISettings>>>,
 ) -> Result<serde_json::Value, String> {
-    let settings: (String, String, String, String, String, String) = sqlx::query_as(
-        "SELECT provider, base_url, model_name, vision_model_name, api_key, proxy_url FROM ai_settings WHERE id = 1"
-    )
-    .fetch_one(&*pool)
-    .await
-    .unwrap_or_else(|_| (
-        "openrouter".to_string(),
-        "https://openrouter.ai/api/v1".to_string(),
-        "meta-llama/llama-3.1-8b-instruct".to_string(),
-        "qwen/qwen-vl-plus".to_string(),
-        String::new(),
-        ai::DEFAULT_PROXY_URL.to_string(),
-    ));
-
-    ai_engine.check_availability(&settings.0, &settings.1, &settings.3, &settings.2, &settings.4, &settings.5)
+    let settings = ai_settings.read().map_err(|e| format!("Settings error: {}", e))?.clone();
+    ai_engine.check_availability(&settings.provider, &settings.base_url, &settings.vision_model_name, &settings.model_name, &settings.api_key, &settings.proxy_url)
         .await
         .map_err(|e| e.to_string())
 }
@@ -48,6 +37,7 @@ async fn check_ai_availability(
 async fn test_ai_generation(
     pool: tauri::State<'_, Pool<Sqlite>>,
     ai_engine: tauri::State<'_, Arc<ai::AIEngine>>,
+    ai_settings: tauri::State<'_, Arc<RwLock<ai::AISettings>>>,
 ) -> Result<serde_json::Value, String> {
     // 1. Pick an image that actually exists on disk
     let images: Vec<(String, String)> = sqlx::query_as("SELECT id, path FROM images ORDER BY ai_analyzed DESC LIMIT 50")
@@ -70,27 +60,14 @@ async fn test_ai_generation(
         }));
     };
 
-    // 2. Run analysis
-    let settings: (String, String, String, String, String, String) = sqlx::query_as(
-        "SELECT provider, base_url, model_name, vision_model_name, api_key, proxy_url FROM ai_settings WHERE id = 1"
-    )
-    .fetch_one(&*pool)
-    .await
-    .unwrap_or_else(|_| (
-        "openrouter".to_string(),
-        "https://openrouter.ai/api/v1".to_string(),
-        "meta-llama/llama-3.1-8b-instruct".to_string(),
-        "qwen/qwen-vl-plus".to_string(),
-        String::new(),
-        ai::DEFAULT_PROXY_URL.to_string(),
-    ));
-
-    let analysis = ai_engine.analyze_image(std::path::Path::new(&path), &settings.0, &settings.1, &settings.3, &settings.4, &settings.5)
+    // 2. Run analysis using cached settings
+    let settings = ai_settings.read().map_err(|e| format!("Settings error: {}", e))?.clone();
+    let analysis = ai_engine.analyze_image(std::path::Path::new(&path), &settings.provider, &settings.base_url, &settings.vision_model_name, &settings.api_key, &settings.proxy_url)
         .await
         .map_err(|e| e.to_string())?;
 
     // 3. Generate a caption
-    let teller = ai::Storyteller::new(settings.0, settings.1, settings.2, settings.4, settings.5);
+    let teller = ai::Storyteller::new(settings.provider, settings.base_url, settings.model_name, settings.api_key, settings.proxy_url);
     let caption = teller.generate_caption(&analysis.tags, Some(&analysis.vibe), None).await;
 
     Ok(serde_json::json!({
@@ -190,6 +167,10 @@ pub fn run() {
                 let ai_engine = Arc::new(ai::AIEngine::new(&app_data_dir).unwrap_or_default());
                 handle.manage(ai_engine.clone());
 
+                // AI settings cache — loaded once and shared via RwLock to eliminate DB queries on hot path
+                let ai_settings = Arc::new(RwLock::new(ai::AISettings::load(&pool).await));
+                handle.manage(ai_settings.clone());
+
                 // Processing worker
                 tokio::spawn(processor::start_processing_worker(
                     rx, 
@@ -197,7 +178,8 @@ pub fn run() {
                     app_data_dir.clone(), 
                     ai_engine.clone(), 
                     handle.clone(), 
-                    proc_state.clone()
+                    proc_state.clone(),
+                    ai_settings.clone(),
                 ));
 
                 // File system watcher — monitors scanned folders for new/deleted files
@@ -256,6 +238,7 @@ pub fn run() {
             stories::generate_story,
             stories::get_stories,
             stories::get_cached_image_base64,
+            stories::get_image_display_path,
             stories::get_ai_status,
             stories::delete_story,
             stories::delete_all_stories,

@@ -5,8 +5,13 @@ import { open } from "@tauri-apps/plugin-dialog";
 import HomeFeed from "./components/HomeFeed";
 import StoryViewer from "./components/StoryViewer";
 import SettingsPanel from "./components/SettingsPanel";
-import ActivityIndicator, { ActivityItem } from "./components/ActivityIndicator";
+import ActivityIndicator from "./components/ActivityIndicator";
 import Logo from "./components/Logo";
+import { useStories } from "./hooks/useStories";
+import { useScan } from "./hooks/useScan";
+import { useScannedFolders } from "./hooks/useScannedFolders";
+import { useAiHealth } from "./hooks/useAiHealth";
+import { useActivities } from "./hooks/useActivities";
 
 export interface ImageRecord {
   id: string;
@@ -58,56 +63,19 @@ export interface ScannedFolder {
 
 type View = "home" | "favorites" | "settings";
 
-let _nextId = 0;
-function mkId() { return String(++_nextId); }
-
 function App() {
   const [view, setView] = useState<View>("home");
-  const [stories, setStories] = useState<Story[]>([]);
   const [activeStory, setActiveStory] = useState<Story | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [scanLog, setScanLog] = useState("Ready to index");
-  const [isScanning, setIsScanning] = useState(false);
-  const [showNoPhotosPopup, setShowNoPhotosPopup] = useState(false);
-  const [aiHealth, setAiHealth] = useState<AiHealthStatus | null>(null);
   const [settingsInitialSection, setSettingsInitialSection] = useState<string | null>(null);
-  const [activities, setActivities] = useState<ActivityItem[]>([]);
-  const [scannedFolders, setScannedFolders] = useState<ScannedFolder[]>([]);
-  const [folderAccessibility, setFolderAccessibility] = useState<Map<string, boolean>>(new Map());
 
-  const addActivity = (label: string): string => {
-    const id = mkId();
-    setActivities((prev) => [...prev, { id, label }]);
-    return id;
-  };
-
-  const removeActivity = (id: string) => {
-    setActivities((prev) => prev.filter((a) => a.id !== id));
-  };
-
-  const loadStories = useCallback(async () => {
-    try {
-      const result = await invoke<Story[]>("get_stories");
-      setStories(result);
-    } catch (e) {
-      console.error("Failed to load stories:", e);
-    }
-  }, []);
-
-  const loadScannedFolders = useCallback(async () => {
-    try {
-      const folders = await invoke<ScannedFolder[]>("get_scanned_folders");
-      setScannedFolders(folders);
-      const accessResults: any[] = await invoke("check_folders_accessibility");
-      const accessMap = new Map<string, boolean>();
-      for (const r of accessResults) {
-        accessMap.set(r.id, r.accessible);
-      }
-      setFolderAccessibility(accessMap);
-    } catch (e) {
-      console.error("Failed to load scanned folders:", e);
-    }
-  }, []);
+  const { stories, setStories, loadStories, handleDeleteStory, handleTogglePin, handleToggleFavorite } = useStories();
+  const { scanLog, setScanLog, isScanning, setIsScanning, showNoPhotosPopup, setShowNoPhotosPopup } = useScan();
+  const { aiHealth, setAiHealth } = useAiHealth();
+  const { activities, setActivities, addActivity, removeActivity } = useActivities();
+  const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
+  const { scannedFolders, folderAccessibility, loadScannedFolders,
+    handleRemoveScannedFolder, handleToggleScannedFolder, handleToggleChildFolder } = useScannedFolders();
 
   useEffect(() => {
     loadStories();
@@ -116,6 +84,16 @@ function App() {
   useEffect(() => {
     loadScannedFolders();
   }, [loadScannedFolders]);
+
+  useEffect(() => {
+    const fetchStatus = async () => {
+      try { setAiStatus(await invoke<AiStatus>("get_ai_status")); }
+      catch (e) { console.error(e); }
+    };
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 5000);
+    return () => clearInterval(interval);
+  }, []);
 
   const loadStoriesDebounced = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -169,6 +147,7 @@ function App() {
       setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, label: `Scan Complete (${event.payload} found)`, progress: 100 } : a));
       setTimeout(() => setActivities(prev => prev.filter(a => a.id !== "indexing")), 5000);
       loadStories();
+      if (event.payload === 0) setShowNoPhotosPopup(true);
     });
 
     const unlistenAiHealth = listen<AiHealthStatus>("ai-health-status", (event) => { setAiHealth(event.payload); });
@@ -176,22 +155,12 @@ function App() {
       setStories(prev => prev.map(s => s.id === event.payload.id ? { ...s, caption: event.payload.caption } : s));
     });
 
-    invoke<AiHealthStatus>("check_ai_availability").then(setAiHealth).catch(console.error);
-
-    // Auto-retry AI health check when disconnected
-    const aiRetry = setInterval(() => {
-      if (aiHealth !== null && !aiHealth.available) {
-        invoke<AiHealthStatus>("check_ai_availability").then(setAiHealth).catch(console.error);
-      }
-    }, 15000);
-
     return () => {
       if (loadStoriesDebounced.current) clearTimeout(loadStoriesDebounced.current);
-      clearInterval(aiRetry);
       Promise.all([unlistenIndexing, unlistenAnalysis, unlistenRefresh, unlistenNoPhotos, unlistenMobileScan, unlistenScanComplete, unlistenAiHealth, unlistenStoryUpdated])
         .then(fns => fns.forEach(f => f()));
     };
-  }, [loadStories, loadScannedFolders, aiHealth]);
+  }, [loadStories, loadScannedFolders, setActivities, setScanLog, setShowNoPhotosPopup, setStories, setAiHealth]);
 
   const handleGenerateStory = async () => {
     setIsGenerating(true);
@@ -216,18 +185,17 @@ function App() {
   const handleAddLocation = async () => {
     if (isMobile) { await runMobileScan(); return; }
     try {
-      const dir = await open({ directory: true, multiple: false });
+      const dir = await open({ directory: true, multiple: false, title: "Select a folder to scan" });
       if (!dir) return;
       setIsScanning(true);
       setView("settings");
-      setScanLog(`Scanning: ${dir}\u2026`);
+      setScanLog(`Scanning: ${dir}…`);
       setActivities(prev => [...prev.filter(a => a.id !== "indexing"), { id: "indexing", label: "Indexing Files", progress: 0 }]);
-      await invoke<ScannedFolder>("add_scanned_folder", { path: dir }).catch(() => {});
+      await invoke<ScannedFolder>("add_scanned_folder", { path: dir }).catch((e) => console.warn("add_scanned_folder (may be duplicate):", e));
       const count = await invoke<number>("start_scan", { dir });
       setScanLog(`Found ${count} images. Indexing...`);
       setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, label: `Indexing (${count})` } : a));
-      loadStories();
-      loadScannedFolders();
+      Promise.all([loadStories(), loadScannedFolders()]);
     } catch (e) { setScanLog(`Error: ${e}`); }
     finally { setIsScanning(false); }
   };
@@ -280,8 +248,7 @@ function App() {
       }
       setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, label: "Scan Complete", progress: 100 } : a));
       setTimeout(() => setActivities(prev => prev.filter(a => a.id !== "indexing")), 5000);
-      loadStories();
-      loadScannedFolders();
+      Promise.all([loadStories(), loadScannedFolders()]);
     } catch (e) {
       console.error("[Mobile] Scan failed:", e);
       setScanLog(`Scan error: ${e}`);
@@ -300,8 +267,7 @@ function App() {
       const count = await invoke<number>("start_scan_device");
       setScanLog(`Found ${count} images.`);
       setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, label: `Indexing (${count})` } : a));
-      loadStories();
-      loadScannedFolders();
+      Promise.all([loadStories(), loadScannedFolders()]);
     } catch (e) { setScanLog(`Error: ${e}`); }
     finally { setIsScanning(false); }
   };
@@ -311,54 +277,20 @@ function App() {
     try {
       const dir = await open({ directory: true, multiple: false, title: "Select a folder to scan" });
       if (!dir) return;
-      const folder = await invoke<ScannedFolder>("add_scanned_folder", { path: dir });
-      setScannedFolders(prev => [folder, ...prev]);
-      setFolderAccessibility(prev => new Map(prev).set(folder.id, true));
+      await invoke<ScannedFolder>("add_scanned_folder", { path: dir });
       setIsScanning(true);
       setScanLog(`Scanning: ${dir}…`);
       setActivities(prev => [...prev.filter(a => a.id !== "indexing"), { id: "indexing", label: "Indexing Files", progress: 0 }]);
       const count = await invoke<number>("start_scan", { dir });
       setScanLog(`Found ${count} images. Indexing...`);
       setActivities(prev => prev.map(a => a.id === "indexing" ? { ...a, label: `Indexing (${count})` } : a));
-      loadStories();
+      Promise.all([loadStories(), loadScannedFolders()]);
     } catch (e) {
       setScanLog(`Error adding folder: ${e}`);
     } finally {
       setIsScanning(false);
     }
-  }, [loadStories]);
-
-  const handleRemoveScannedFolder = useCallback(async (id: string) => {
-    try {
-      await invoke("remove_scanned_folder", { id });
-      setScannedFolders(prev => prev.filter(f => f.id !== id));
-      setFolderAccessibility(prev => { const m = new Map(prev); m.delete(id); return m; });
-    } catch (e) {
-      console.error("Failed to remove folder:", e);
-    }
-  }, []);
-
-  const handleToggleScannedFolder = useCallback(async (id: string) => {
-    setScannedFolders(prev => prev.map(f => f.id === id ? { ...f, is_enabled: !f.is_enabled } : f));
-    try {
-      const updated = await invoke<ScannedFolder>("toggle_scanned_folder", { id });
-      setScannedFolders(prev => prev.map(f => f.id === id ? updated : f));
-    } catch (e) {
-      // Revert optimistic update on failure
-      setScannedFolders(prev => prev.map(f => f.id === id ? { ...f, is_enabled: !f.is_enabled } : f));
-      console.error("Failed to toggle folder:", e);
-    }
-  }, []);
-
-  const handleToggleChildFolder = useCallback(async (parentPath: string, childName: string) => {
-    try {
-      await invoke<boolean>("toggle_child_override", { parentPath, childName });
-      // Refetch folder children to update their disabled state
-      // The FolderRow component will re-invoke get_folder_children when expanded again
-    } catch (e) {
-      console.error("Failed to toggle child folder:", e);
-    }
-  }, []);
+  }, [loadStories, loadScannedFolders, setScanLog, setActivities, setIsScanning]);
 
   const handleReScanFolders = useCallback(async () => {
     if (isMobile) { await runMobileScan(); return; }
@@ -366,43 +298,23 @@ function App() {
     try {
       const count = await invoke<number>("start_scan_device");
       setScanLog(`Re-scan complete. Found ${count} images.`);
-      loadStories();
-      loadScannedFolders();
+      Promise.all([loadStories(), loadScannedFolders()]);
     } catch (e) {
       setScanLog(`Re-scan error: ${e}`);
     } finally {
       setIsScanning(false);
     }
-  }, [loadStories, loadScannedFolders]);
+  }, [loadStories, loadScannedFolders, setScanLog, setIsScanning]);
 
   const navigateToSettingsSection = (sectionId: string) => {
     setSettingsInitialSection(sectionId);
     setView("settings");
   };
 
-  const handleDeleteStory = async (id: string) => {
-    try { await invoke("delete_story", { id }); setStories((prev) => prev.filter((s) => s.id !== id)); }
-    catch (e) { console.error(e); }
-  };
-
-  const handleTogglePin = async (id: string) => {
-    try {
-      const is_pinned = await invoke<boolean>("toggle_story_pin", { id });
-      setStories((prev) => [...prev].map((s) => (s.id === id ? { ...s, is_pinned } : s))
-        .sort((a, b) => { if (a.is_pinned !== b.is_pinned) return a.is_pinned ? -1 : 1; return (new Date(b.created_at).getTime() || 0) - (new Date(a.created_at).getTime() || 0); }));
-    } catch (e) { console.error(e); }
-  };
-
-  const handleToggleFavorite = async (id: string) => {
-    try { const is_favorite = await invoke<boolean>("toggle_story_favorite", { id }); setStories((prev) => prev.map((s) => (s.id === id ? { ...s, is_favorite } : s))); }
-    catch (e) { console.error(e); }
-  };
-
   return (
     <div className="flex flex-col-reverse sm:flex-row w-screen h-screen overflow-hidden bg-surface-950 text-surface-50 font-sans selection:bg-neon-500/40">
       {activeStory && <StoryViewer story={activeStory} onClose={() => setActiveStory(null)} />}
 
-      {/* Cyber Background */}
       <div className="cyber-bg">
         <div className="cyber-particles">
           {Array.from({ length: 12 }).map((_, i) => <div key={i} className="cyber-particle" />)}
@@ -410,7 +322,6 @@ function App() {
         <div className="cyber-scanline" />
       </div>
 
-      {/* Navigation */}
       <nav className="relative z-10 flex flex-row sm:flex-col items-center justify-between sm:justify-start w-full sm:w-20 h-20 sm:h-full px-4 py-2 sm:py-12 sm:px-0 gap-2 sm:gap-6 shrink-0 border-t sm:border-t-0 sm:border-r border-neon-500/10 bg-surface-900/60 backdrop-blur-xl shadow-2xl safe-area-nav">
         <div className="hidden sm:flex items-center justify-center mb-4 mt-2">
           <Logo size="md" animated />
@@ -432,7 +343,7 @@ function App() {
           </button>
         </div>
 
-        <ActivityIndicator activities={activities} />
+        <ActivityIndicator activities={activities} isIndexingPaused={aiStatus?.is_indexing_paused ?? false} isAnalysisPaused={aiStatus?.is_analysis_paused ?? false} />
 
         <div className="hidden sm:flex sm:w-full sm:px-3 sm:mb-4 h-full sm:h-auto items-center">
           <button className="flex sm:flex-col items-center justify-center w-12 sm:w-full aspect-square rounded-2xl bg-gradient-to-tr from-neon-500 to-neon-400 text-white shadow-lg shadow-neon-500/30 cursor-pointer transition-all duration-300 hover:scale-[1.05] hover:shadow-neon-500/50 active:scale-95 group relative overflow-hidden" onClick={handleAddLocation} title="Add Folder" aria-label="Add Folder">
@@ -444,7 +355,6 @@ function App() {
 
       </nav>
 
-      {/* Main Content */}
       <main className="relative z-10 flex-[1_1_100%] overflow-hidden flex flex-col safe-area-content">
         {view === "home" && (
           <HomeFeed stories={stories} onStoryClick={setActiveStory} onGenerate={handleGenerateStory} isGenerating={isGenerating}
@@ -467,7 +377,6 @@ function App() {
         )}
       </main>
 
-      {/* No Photos Popup */}
       {showNoPhotosPopup && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-surface-950/80 backdrop-blur-md animate-in fade-in duration-300">
           <div className="relative w-full max-w-sm cyber-card p-8 shadow-2xl shadow-black/50 animate-in zoom-in-95 duration-300">

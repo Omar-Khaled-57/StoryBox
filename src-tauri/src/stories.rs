@@ -145,15 +145,16 @@ pub async fn generate_random_story(pool: &Pool<Sqlite>) -> Result<Option<Story>>
         return Ok(None);
     }
 
-    // Pull AI features for all images in one batch query
-    let ids: Vec<String> = images.iter().map(|(id, _, _, _)| format!("'{}'", id)).collect();
-    let features_rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
-        &format!("SELECT image_id, tags, vibe FROM image_features WHERE image_id IN ({})", ids.join(","))
-    )
-    .fetch_all(pool)
-    .await?;
+    // Pull AI features for all images in one batch query — parameterized
+    let placeholders: Vec<String> = images.iter().map(|_| "?".to_string()).collect();
+    let features_sql = format!("SELECT image_id, tags, vibe FROM image_features WHERE image_id IN ({})", placeholders.join(","));
+    let mut features_query = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(&features_sql);
+    for (id, _, _, _) in &images {
+        features_query = features_query.bind(id);
+    }
+    let features_rows = features_query.fetch_all(pool).await?;
 
-    let mut features_map: std::collections::HashMap<String, (Option<String>, Option<String>)> = std::collections::HashMap::new();
+    let mut features_map: std::collections::HashMap<String, (Option<String>, Option<String>)> = std::collections::HashMap::with_capacity(images.len());
     for (img_id, tags_json, vibe) in features_rows {
         features_map.insert(img_id, (tags_json, vibe));
     }
@@ -177,17 +178,17 @@ pub async fn generate_random_story(pool: &Pool<Sqlite>) -> Result<Option<Story>>
     let story_id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
 
-    // Persist story
+    // Persist story + images in a single transaction
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO stories (id, theme_type, caption, created_at) VALUES (?, 'random', ?, ?)",
     )
     .bind(&story_id)
     .bind(&caption)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
-    // Persist story_images mapping
     for (i, img) in story_images.iter().enumerate() {
         sqlx::query(
             "INSERT OR IGNORE INTO story_images (story_id, image_id, sequence_order) VALUES (?, ?, ?)"
@@ -195,9 +196,10 @@ pub async fn generate_random_story(pool: &Pool<Sqlite>) -> Result<Option<Story>>
         .bind(&story_id)
         .bind(&img.id)
         .bind(i as i32)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
 
     Ok(Some(Story {
         id: story_id,
@@ -238,7 +240,8 @@ pub async fn generate_ai_story(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> R
                   OR i.path LIKE fco.parent_path || '/' || fco.child_name || '/' || '%'
                   OR i.path = fco.parent_path || '\\' || fco.child_name
                   OR i.path LIKE fco.parent_path || '\\' || fco.child_name || '\\' || '%')
-         )"
+         )
+         LIMIT 5000"
     )
     .fetch_all(pool)
     .await?;
@@ -247,21 +250,22 @@ pub async fn generate_ai_story(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> R
         return Ok(None);
     }
 
-    // 2. Clustering Strategy (Date vs Tag)
-    let mut date_clusters: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    let mut tag_counts = std::collections::HashMap::new();
+    // 2. Pre-parse all tags once before clustering/filtering
+    let features_with_tags: Vec<(String, String, Option<String>, Vec<String>, Option<String>)> = features.iter()
+        .map(|(id, path, dt, tj, dc)| (id.clone(), path.clone(), dt.clone(), parse_tags(tj.clone()), dc.clone()))
+        .collect();
 
-    for (id, _, date_taken, tags_json, _) in &features {
-        // Date clustering (YYYY-MM-DD or YYYY-MM)
+    let mut date_clusters: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::with_capacity(features_with_tags.len().min(100));
+    let mut tag_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::with_capacity(features_with_tags.len() * 5);
+
+    for (id, _, date_taken, tags, _) in &features_with_tags {
         if let Some(dt) = date_taken {
-            let day = &dt[..10.min(dt.len())]; // Daily cluster
+            let day = &dt[..10.min(dt.len())];
             date_clusters.entry(day.to_string()).or_default().push(id.clone());
         }
 
-        // Tag counts
-        let tags = parse_tags(tags_json.clone());
         for tag in tags {
-            *tag_counts.entry(tag).or_insert(0u32) += 1;
+            *tag_counts.entry(tag.clone()).or_insert(0u32) += 1;
         }
     }
 
@@ -299,8 +303,8 @@ pub async fn generate_ai_story(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> R
             if pool_size == 0 { return Ok(None); }
             let theme_tag = sorted_tags[rng.gen_range(0..pool_size)].0.clone();
             
-            let ids = features.iter()
-                .filter(|(_, _, _, tj, _)| parse_tags(tj.clone()).contains(&theme_tag))
+            let ids = features_with_tags.iter()
+                .filter(|(_, _, _, tags, _)| tags.contains(&theme_tag))
                 .map(|(id, _, _, _, _)| id.clone())
                 .collect();
             (theme_tag, ids)
@@ -316,21 +320,23 @@ pub async fn generate_ai_story(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> R
     }
     let selected_ids = &final_ids[..final_ids.len().min(8)];
 
-    // 4. Build story images and collect context for AI — batched queries
-    let ids_str: Vec<String> = selected_ids.iter().map(|id| format!("'{}'", id)).collect();
-    let id_list = ids_str.join(",");
+    // 4. Build story images and collect context for AI — parameterized IN clauses
+    let placeholders: Vec<String> = selected_ids.iter().map(|_| "?".to_string()).collect();
+    let in_clause = placeholders.join(",");
 
-    let img_rows: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
-        &format!("SELECT id, path, date_taken, ai_analyzed FROM images WHERE id IN ({})", id_list)
-    )
-    .fetch_all(pool)
-    .await?;
+    let img_sql = format!("SELECT id, path, date_taken, ai_analyzed FROM images WHERE id IN ({})", in_clause);
+    let mut img_query = sqlx::query_as::<_, (String, String, Option<String>, bool)>(&img_sql);
+    for id in selected_ids {
+        img_query = img_query.bind(id);
+    }
+    let img_rows = img_query.fetch_all(pool).await?;
 
-    let feat_rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
-        &format!("SELECT image_id, tags, dominant_color, vibe FROM image_features WHERE image_id IN ({})", id_list)
-    )
-    .fetch_all(pool)
-    .await?;
+    let feat_sql = format!("SELECT image_id, tags, dominant_color, vibe FROM image_features WHERE image_id IN ({})", in_clause);
+    let mut feat_query = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(&feat_sql);
+    for id in selected_ids {
+        feat_query = feat_query.bind(id);
+    }
+    let feat_rows = feat_query.fetch_all(pool).await?;
 
     let feat_map: std::collections::HashMap<String, (Option<String>, Option<String>, Option<String>)> =
         feat_rows.into_iter().map(|(id, t, c, v)| (id, (t, c, v))).collect();
@@ -368,6 +374,7 @@ pub async fn generate_ai_story(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> R
     let story_id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
 
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO stories (id, theme_type, caption, created_at) VALUES (?, ?, ?, ?)",
     )
@@ -375,7 +382,7 @@ pub async fn generate_ai_story(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> R
     .bind(&theme)
     .bind(&template_caption)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     for (i, img) in story_images.iter().enumerate() {
@@ -383,9 +390,10 @@ pub async fn generate_ai_story(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> R
             .bind(&story_id)
             .bind(&img.id)
             .bind(i as i32)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
+    tx.commit().await?;
 
     // 6. Background Enrichment: AI Caption
     let pool_bg = pool.clone();
@@ -429,8 +437,8 @@ pub async fn generate_ai_story(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -> R
     }))
 }
 
-/// Fetch all stories with their images — uses a single JOIN query (O(1) DB round-trips).
-pub async fn get_all_stories(pool: &Pool<Sqlite>) -> Result<Vec<Story>> {
+/// Fetch stories with their images — uses pagination (LIMIT ? OFFSET ?).
+pub async fn get_all_stories(pool: &Pool<Sqlite>, limit: i64, offset: i64) -> Result<Vec<Story>> {
     // Single query: stories → story_images → images → image_features in one JOIN
     let rows: Vec<(String, String, String, String, bool, bool, String, String, Option<String>, bool, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT s.id, s.theme_type, COALESCE(s.caption, ''), s.created_at,
@@ -442,8 +450,10 @@ pub async fn get_all_stories(pool: &Pool<Sqlite>) -> Result<Vec<Story>> {
          JOIN images i ON i.id = si.image_id
          LEFT JOIN image_features f ON f.image_id = i.id
          ORDER BY s.is_pinned DESC, s.created_at DESC, si.sequence_order
-         LIMIT 200"
+         LIMIT ? OFFSET ?"
     )
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await?;
 
@@ -498,15 +508,15 @@ pub async fn internal_generate_story(
     pool: &Pool<Sqlite>,
     app: &tauri::AppHandle
 ) -> Result<Option<Story>, String> {
-    // 1. Check if genuine AI is configured (not mock)
-    let provider: Result<(String,), _> = sqlx::query_as("SELECT provider FROM ai_settings WHERE id = 1")
+    // 1. Check if genuine AI is configured (not mock) and has an API key or proxy URL
+    let settings: Result<(String, String, String), _> = sqlx::query_as("SELECT provider, api_key, proxy_url FROM ai_settings WHERE id = 1")
         .fetch_one(pool)
         .await;
 
-    let ai_configured = matches!(&provider, Ok((p,)) if p != "mock");
+    let ai_configured = matches!(&settings, Ok((p, key, proxy)) if p != "mock" && (!key.is_empty() || !proxy.is_empty()));
 
     if !ai_configured {
-        println!("[Stories] AI provider is mock or unconfigured. Falling back to template-based random story.");
+        println!("[Stories] AI provider is mock or missing API key and proxy URL. Falling back to template-based random story.");
         return generate_random_story(pool)
             .await
             .map_err(|e| e.to_string());
@@ -540,10 +550,45 @@ pub async fn generate_story(
     internal_generate_story(&*state, &app).await
 }
 
-/// Returns all stories with their images for the frontend feed.
+/// Returns stories with their images for the frontend feed, with optional pagination.
 #[tauri::command]
-pub async fn get_stories(state: tauri::State<'_, Pool<Sqlite>>) -> Result<Vec<Story>, String> {
-    get_all_stories(&*state).await.map_err(|e| e.to_string())
+pub async fn get_stories(
+    state: tauri::State<'_, Pool<Sqlite>>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Vec<Story>, String> {
+    get_all_stories(&*state, limit.unwrap_or(200), offset.unwrap_or(0)).await.map_err(|e| e.to_string())
+}
+
+/// Returns the file path for a cached image (thumbnail or display) by id.
+/// Fallback to original file path if cache missing — frontend uses convertFileSrc.
+#[tauri::command]
+pub async fn get_image_display_path(
+    state: tauri::State<'_, Pool<Sqlite>>,
+    app: tauri::AppHandle, 
+    id: String, 
+    image_type: String
+) -> Result<String, String> {
+    use tauri::Manager;
+    let app_dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let sub_dir = match image_type.as_str() {
+        "thumb" => "thumbnails",
+        "display" => "display",
+        _ => return Err("Invalid image_type (thumb/display)".to_string()),
+    };
+    let cache_path = app_dir.join(sub_dir).join(format!("{}.jpg", id));
+    if cache_path.exists() {
+        return Ok(cache_path.to_string_lossy().to_string());
+    }
+    let original_path: String = sqlx::query_scalar("SELECT path FROM images WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&*state)
+        .await
+        .map_err(|e| e.to_string())?;
+    if std::path::Path::new(&original_path).exists() {
+        return Ok(original_path);
+    }
+    Err("Image file not found on disk and no thumbnail available.".to_string())
 }
 
 /// Returns a base64 data URI for an image (thumbnail or display) by id.
@@ -599,7 +644,8 @@ pub async fn get_cached_image_base64(
 #[tauri::command]
 pub async fn get_ai_status(
     state: tauri::State<'_, Pool<Sqlite>>,
-    proc_state: tauri::State<'_, Arc<ProcessingState>>
+    proc_state: tauri::State<'_, Arc<ProcessingState>>,
+    ai_settings: tauri::State<'_, Arc<std::sync::RwLock<crate::ai::AISettings>>>,
 ) -> Result<AiStatus, String> {
     let counts: (i64, i64) = sqlx::query_as("SELECT COUNT(*) as total, COALESCE(SUM(ai_analyzed), 0) as analyzed FROM images")
         .fetch_one(&*state)
@@ -609,21 +655,17 @@ pub async fn get_ai_status(
     let total = counts.0;
     let analyzed = counts.1;
 
-    let settings: (String, String, String) = sqlx::query_as("SELECT provider, model_name, proxy_url FROM ai_settings WHERE id = 1")
-        .fetch_one(&*state)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let is_mock = settings.0 == "mock";
-    let engine_name = match settings.0.as_str() {
+    let settings = ai_settings.read().map_err(|e| format!("Settings error: {}", e))?;
+    let is_mock = settings.provider == "mock";
+    let engine_name = match settings.provider.as_str() {
         "openrouter" => {
-            if !settings.2.is_empty() {
+            if !settings.proxy_url.is_empty() {
                 format!("OpenRouter via Proxy")
             } else {
-                format!("OpenRouter ({})", settings.1)
+                format!("OpenRouter ({})", settings.model_name)
             }
         }
-        "ollama" => format!("Ollama ({})", settings.1),
+        "ollama" => format!("Ollama ({})", settings.model_name),
         _ => "Mock Simulation (Rust)".to_string(),
     };
 
@@ -669,6 +711,7 @@ pub async fn delete_story(
 #[tauri::command]
 pub async fn delete_all_stories(
     state: tauri::State<'_, Pool<Sqlite>>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     let pool = &*state;
     
@@ -683,6 +726,9 @@ pub async fn delete_all_stories(
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
+
+    use tauri::Emitter;
+    let _ = app.emit("refresh-stories", ());
 
     Ok(())
 }
@@ -722,6 +768,8 @@ pub async fn run_automation_tasks(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -
                 .execute(pool)
                 .await?;
         }
+        use tauri::Emitter;
+        let _ = app.emit("refresh-stories", ());
     }
 
     // 3. Dynamic Cleanup logic
@@ -756,6 +804,9 @@ pub async fn run_automation_tasks(pool: &Pool<Sqlite>, app: &tauri::AppHandle) -
             .bind(now.to_rfc3339())
             .execute(pool)
             .await?;
+
+        use tauri::Emitter;
+        let _ = app.emit("refresh-stories", ());
     }
 
     Ok(())
@@ -827,7 +878,8 @@ pub async fn get_ai_settings(state: tauri::State<'_, Pool<Sqlite>>) -> Result<(S
     Ok(row)
 }
 
-/// Persists the AI provider configuration from the frontend settings form.
+/// Persists the AI provider configuration from the frontend settings form
+/// and updates the in-memory cache so the processing worker picks it up immediately.
 #[tauri::command]
 pub async fn update_ai_settings(
     state: tauri::State<'_, Pool<Sqlite>>,
@@ -839,21 +891,29 @@ pub async fn update_ai_settings(
     proxy_url: String,
     auto_gen_interval_hours: i32,
     cleanup_interval_hours: i32,
+    ai_settings: tauri::State<'_, Arc<std::sync::RwLock<crate::ai::AISettings>>>,
 ) -> Result<(), String> {
     sqlx::query(
         "UPDATE ai_settings SET provider = ?, base_url = ?, model_name = ?, vision_model_name = ?, api_key = ?, proxy_url = ?, auto_gen_interval_hours = ?, cleanup_interval_hours = ? WHERE id = 1"
     )
-    .bind(provider)
-    .bind(base_url)
-    .bind(model_name)
-    .bind(vision_model_name)
-    .bind(api_key)
-    .bind(proxy_url)
+    .bind(&provider)
+    .bind(&base_url)
+    .bind(&model_name)
+    .bind(&vision_model_name)
+    .bind(&api_key)
+    .bind(&proxy_url)
     .bind(auto_gen_interval_hours)
     .bind(cleanup_interval_hours)
     .execute(&*state)
     .await
     .map_err(|e| e.to_string())?;
+
+    // Refresh in-memory cache so the processing worker picks up changes without a restart
+    let mut cached = ai_settings.write().map_err(|e| format!("Settings lock error: {}", e))?;
+    *cached = crate::ai::AISettings {
+        provider, base_url, model_name, vision_model_name, api_key, proxy_url,
+        auto_gen_interval_hours, cleanup_interval_hours,
+    };
     Ok(())
 }
 

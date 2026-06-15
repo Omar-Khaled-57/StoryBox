@@ -66,6 +66,10 @@ export default function StoryViewer({ story, onClose }: StoryViewerProps) {
   useEffect(() => { setProgress(0); elapsedRef.current = 0; }, [index]);
 
   useEffect(() => {
+    return () => { if (holdTimer.current) clearTimeout(holdTimer.current); };
+  }, []);
+
+  useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === "ArrowRight") goNext();
       if (e.key === "ArrowLeft") goPrev();

@@ -31,10 +31,13 @@ function HomeFeed({
   const [startX, setStartX] = useState(0);
   const [scrollLeft, setScrollLeft] = useState(0);
   const [dragged, setDragged] = useState(false);
+  const draggedRef = useRef(false);
+  draggedRef.current = dragged;
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if (!scrollRef.current) return;
     setIsDragging(true); setDragged(false);
+    draggedRef.current = false;
     setStartX(e.pageX - scrollRef.current.offsetLeft);
     setScrollLeft(scrollRef.current.scrollLeft);
   }, []);
@@ -45,7 +48,7 @@ function HomeFeed({
     e.preventDefault();
     const x = e.pageX - scrollRef.current.offsetLeft;
     const walk = (x - startX) * 2;
-    if (Math.abs(x - startX) > 5) setDragged(true);
+    if (Math.abs(x - startX) > 5) { setDragged(true); draggedRef.current = true; }
     scrollRef.current.scrollLeft = scrollLeft - walk;
   }, [isDragging, startX, scrollLeft]);
 
@@ -114,10 +117,11 @@ function HomeFeed({
             className={`flex py-4 gap-5 overflow-x-auto pb-6 -mx-10 px-10 scrollbar-hide ${isDragging ? 'cursor-grabbing select-none' : 'cursor-grab'}`}>
             {stories.map((story) => (
               <StoryCard key={story.id} story={story}
-                onClick={() => { if (!dragged) onStoryClick(story); }}
-                onDelete={() => onDeleteStory(story.id)}
-                onTogglePin={() => onTogglePin(story.id)}
-                onToggleFavorite={() => onToggleFavorite(story.id)} />
+                onSelectStory={onStoryClick}
+                onDeleteStory={onDeleteStory}
+                onTogglePin={onTogglePin}
+                onToggleFavorite={onToggleFavorite}
+                draggedRef={draggedRef} />
             ))}
           </div>
         </section>
@@ -126,8 +130,8 @@ function HomeFeed({
   );
 }
 
-const StoryCard = memo(function StoryCard({ story, onClick, onDelete, onTogglePin, onToggleFavorite }: {
-  story: Story; onClick: () => void; onDelete: () => void; onTogglePin: () => void; onToggleFavorite: () => void;
+const StoryCard = memo(function StoryCard({ story, onSelectStory, onDeleteStory, onTogglePin, onToggleFavorite, draggedRef }: {
+  story: Story; onSelectStory: (s: Story) => void; onDeleteStory: (id: string) => void; onTogglePin: (id: string) => void; onToggleFavorite: (id: string) => void; draggedRef: React.MutableRefObject<boolean>;
 }) {
   const firstImage = story.images[0];
   const imageCount = story.images.length;
@@ -163,7 +167,7 @@ const StoryCard = memo(function StoryCard({ story, onClick, onDelete, onTogglePi
 
   return (
     <div ref={cardRef} className="animated-border-wrap min-w-[280px] max-w-[280px] h-[440px] shrink-0 snap-center cursor-pointer transition-all duration-500 ease-out hover:-translate-y-2 hover:shadow-neon-500/20 group"
-      onClick={onClick} role="button" tabIndex={0} onKeyDown={(e) => e.key === "Enter" && onClick()}>
+      onClick={() => { if (!draggedRef.current) onSelectStory(story); }} role="button" tabIndex={0} onKeyDown={(e) => e.key === "Enter" && !draggedRef.current && onSelectStory(story)}>
       <div className="animated-border-inner bg-surface-800 shadow-lg">
         <div className="absolute inset-0 transition-transform duration-700 group-hover:scale-105">
         {imgSrc ? (
@@ -191,18 +195,18 @@ const StoryCard = memo(function StoryCard({ story, onClick, onDelete, onTogglePi
 
             <div className={`absolute top-10 right-0 w-44 bg-surface-900/95 backdrop-blur-xl border border-neon-500/20 rounded-xl shadow-2xl overflow-hidden z-20 ${menuClosing ? "animate-scale-out" : "animate-scale-in"}`}>
               <button className="w-full text-left px-4 py-3 text-sm font-medium text-surface-200 hover:bg-neon-500/10 hover:text-neon-200 transition-colors flex items-center gap-3 border-none bg-transparent cursor-pointer"
-                onClick={(e) => { e.stopPropagation(); onTogglePin(); closeMenu(); }}>
+                onClick={(e) => { e.stopPropagation(); onTogglePin(story.id); closeMenu(); }}>
                 <svg className={`w-4 h-4 ${story.is_pinned ? 'text-neon-400 fill-neon-400' : ''}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 00-1.11-1.79l-1.78-.9A2 2 0 0115 10.76V6a3 3 0 00-3-3 3 3 0 00-3 3v4.76a2 2 0 01-1.11 1.79l-1.78.9A2 2 0 005 15.24V17z"/></svg>
                 {story.is_pinned ? 'Unpin' : 'Pin to Top'}
               </button>
               <button className="w-full text-left px-4 py-3 text-sm font-medium text-surface-200 hover:bg-neon-500/10 hover:text-neon-200 transition-colors flex items-center gap-3 border-none bg-transparent cursor-pointer"
-                onClick={(e) => { e.stopPropagation(); onToggleFavorite(); closeMenu(); }}>
+                onClick={(e) => { e.stopPropagation(); onToggleFavorite(story.id); closeMenu(); }}>
                 <svg className={`w-4 h-4 ${story.is_favorite ? 'text-cyber-400 fill-cyber-400' : ''}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/></svg>
                 {story.is_favorite ? 'Unsave' : 'Save'}
               </button>
               <div className="h-[1px] bg-neon-500/10 my-1" />
               <button className="w-full text-left px-4 py-3 text-sm font-medium text-red-400 hover:bg-red-500/10 transition-colors flex items-center gap-3 border-none bg-transparent cursor-pointer"
-                onClick={(e) => { e.stopPropagation(); onDelete(); closeMenu(); }}>
+                onClick={(e) => { e.stopPropagation(); onDeleteStory(story.id); closeMenu(); }}>
                 <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2M10 11v6M14 11v6"/></svg>
                 Delete
               </button>

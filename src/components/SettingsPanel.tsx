@@ -528,6 +528,7 @@ function AiSettingsSection() {
         autoGenIntervalHours: Number(autoGenInterval), cleanupIntervalHours: Number(cleanupInterval)
       });
       setMessage("Saved!"); setTimeout(() => setMessage(""), 3000);
+      invoke<AiHealthStatus>("check_ai_availability").then(setAiHealth).catch(console.error);
     } catch (e) { setMessage(`Error: ${e}`); }
     finally { setSaving(false); }
   };

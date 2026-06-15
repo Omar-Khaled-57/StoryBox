@@ -4,12 +4,17 @@ version = "3.0.2"
 description = "AI-powered photo storytelling app — powered by OpenRouter"
 authors = ["StoryBox Team"]
 edition = "2021"
+default-run = "storybox3"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
 name = "tauri_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
 
 [profile.dev]
 lto = "thin"
@@ -38,4 +43,7 @@ base64 = "0.22.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 notify = { version = "7", features = [] }
 lru = "0.12"
+thiserror = "1.0"
+kamadak-exif = "0.5"
+tracing = "0.1"
 

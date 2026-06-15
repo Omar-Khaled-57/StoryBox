@@ -67,6 +67,31 @@ pub async fn scan_persisted_folders(
     Ok(total_count)
 }
 
+/// Like scan_persisted_folders but skips paths already scanned (prevents double-counting).
+async fn scan_persisted_folders_except(
+    pool: &Pool<Sqlite>,
+    tx: &Sender<IndexingJob>,
+    proc_state: Arc<ProcessingState>,
+    exclude: &[String],
+) -> Result<usize, String> {
+    let folders = get_enabled_folders(pool).await;
+    let mut total_count = 0;
+    for folder in &folders {
+        let p_str = &folder.path;
+        if exclude.iter().any(|e| e == p_str || p_str.starts_with(e)) {
+            continue;
+        }
+        let path = PathBuf::from(p_str);
+        if path.exists() {
+            match scan_directory(&path, tx, proc_state.clone()).await {
+                Ok(c) => total_count += c,
+                Err(e) => eprintln!("Error scanning {:?}: {}", path, e),
+            }
+        }
+    }
+    Ok(total_count)
+}
+
 /// Returns all scanned folders (enabled and disabled) for the UI.
 #[tauri::command]
 pub async fn get_scanned_folders(pool: tauri::State<'_, Pool<Sqlite>>) -> Result<Vec<ScannedFolder>, String> {
@@ -239,6 +264,7 @@ pub async fn scan_directory(dir: &Path, tx: &Sender<IndexingJob>, state: Arc<Pro
 
     let added_count = tokio::task::spawn_blocking(move || {
         let mut local_count = 0;
+        let mut yield_counter = 0u64;
         // Follow links is VITAL on Windows 11 where Pictures is often a junction to OneDrive
         for entry in WalkDir::new(dir).follow_links(true).into_iter().filter_map(|e| e.ok()) {
             if entry.file_type().is_file() {
@@ -257,6 +283,11 @@ pub async fn scan_directory(dir: &Path, tx: &Sender<IndexingJob>, state: Arc<Pro
                         }
                     }
                 }
+            }
+            // Yield every 1000 entries to avoid starving the async runtime
+            yield_counter += 1;
+            if yield_counter % 1000 == 0 {
+                std::thread::yield_now();
             }
         }
         local_count
@@ -367,7 +398,7 @@ async fn desktop_scan(
         search_paths.retain(|p| !disabled.contains(&p.to_string_lossy().to_string()));
     }
 
-    for p in search_paths {
+    for p in &search_paths {
         if p.exists() {
             match scan_directory(&p, tx, proc_state.clone()).await {
                 Ok(c) => total_count += c,
@@ -377,7 +408,9 @@ async fn desktop_scan(
     }
 
     if let Some(pool) = pool {
-        match scan_persisted_folders(pool, tx, proc_state.clone()).await {
+        // Exclude paths already scanned above so we don't double-count
+        let scanned_paths: Vec<String> = search_paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        match scan_persisted_folders_except(pool, tx, proc_state.clone(), &scanned_paths).await {
             Ok(c) => total_count += c,
             Err(e) => eprintln!("Error scanning persisted folders: {}", e),
         }

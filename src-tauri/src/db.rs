@@ -30,11 +30,27 @@ pub async fn init_db(app_handle: &AppHandle) -> Result<Pool<Sqlite>, sqlx::Error
     // Set up connection options
     let options = SqliteConnectOptions::new()
         .filename(&db_path)
-        .create_if_missing(true);
+        .create_if_missing(true)
+        .foreign_keys(true);
 
     let pool = SqlitePoolOptions::new()
         .max_connections(20)
         .connect_with(options)
+        .await?;
+
+    // Apply WAL mode for concurrent read/write performance
+    sqlx::query("PRAGMA journal_mode=WAL;")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA synchronous=NORMAL;")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA busy_timeout=5000;")
+        .execute(&pool)
+        .await?;
+    // Cache size: 64MB (64,000 * 1KB pages)
+    sqlx::query("PRAGMA cache_size=-64000;")
+        .execute(&pool)
         .await?;
 
     // Apply the schema
@@ -51,7 +67,9 @@ async fn create_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
             date_taken DATETIME,
             lat REAL,
             lon REAL,
-            ai_analyzed BOOLEAN DEFAULT 0
+            ai_analyzed BOOLEAN DEFAULT 0,
+            file_size INTEGER NOT NULL DEFAULT 0,
+            file_modified INTEGER NOT NULL DEFAULT 0
         );",
     )
     .execute(pool)
@@ -63,8 +81,7 @@ async fn create_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
             tags TEXT,
             dominant_color TEXT,
             vibe TEXT,
-            embedding BLOB,
-            FOREIGN KEY(image_id) REFERENCES images(id)
+            FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
         );",
     )
     .execute(pool)
@@ -89,12 +106,12 @@ async fn create_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS story_images (
-            story_id TEXT,
-            image_id TEXT,
+            story_id TEXT NOT NULL,
+            image_id TEXT NOT NULL,
             sequence_order INTEGER,
             PRIMARY KEY (story_id, image_id),
-            FOREIGN KEY(story_id) REFERENCES stories(id),
-            FOREIGN KEY(image_id) REFERENCES images(id)
+            FOREIGN KEY(story_id) REFERENCES stories(id) ON DELETE CASCADE,
+            FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
         );",
     )
     .execute(pool)
@@ -159,9 +176,19 @@ async fn create_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Migration: add file_size/file_modified to existing databases
+    let _ = sqlx::query("ALTER TABLE images ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE images ADD COLUMN file_modified INTEGER NOT NULL DEFAULT 0").execute(pool).await;
+
+    // Migration: add embedding column to image_features (for similarity search)
+    let _ = sqlx::query("ALTER TABLE image_features ADD COLUMN embedding BLOB").execute(pool).await;
+
     // Performance indexes for common query patterns
-    // These use IF NOT EXISTS so they are safe on existing databases
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_images_ai_analyzed ON images(ai_analyzed)")
+        .execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_images_file_size_mod ON images(file_size, file_modified)")
+        .execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_images_date_taken ON images(date_taken)")
         .execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_story_images_story_id ON story_images(story_id)")
         .execute(pool).await;

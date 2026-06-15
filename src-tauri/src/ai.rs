@@ -14,6 +14,44 @@ use std::path::Path;
 pub const DEFAULT_PROXY_URL: &str =
     "https://pawylsallgbfnzzmakac.supabase.co/functions/v1/openrouter-proxy";
 
+/// AI provider settings cached once and shared via Arc<RwLock<>>
+/// to eliminate repeated DB queries on the hot path.
+#[derive(Debug, Clone)]
+pub struct AISettings {
+    pub provider: String,
+    pub base_url: String,
+    pub model_name: String,
+    pub vision_model_name: String,
+    pub api_key: String,
+    pub proxy_url: String,
+    pub auto_gen_interval_hours: i32,
+    pub cleanup_interval_hours: i32,
+}
+
+impl AISettings {
+    /// Load settings from the DB (single-row table).
+    pub async fn load(pool: &sqlx::Pool<sqlx::Sqlite>) -> Self {
+        sqlx::query_as::<_, (String, String, String, String, String, String, i32, i32)>(
+            "SELECT provider, base_url, model_name, vision_model_name, api_key, proxy_url, auto_gen_interval_hours, cleanup_interval_hours FROM ai_settings WHERE id = 1"
+        )
+        .fetch_one(pool)
+        .await
+        .map(|(provider, base_url, model_name, vision_model_name, api_key, proxy_url, auto_gen_interval_hours, cleanup_interval_hours)| Self {
+            provider, base_url, model_name, vision_model_name, api_key, proxy_url, auto_gen_interval_hours, cleanup_interval_hours,
+        })
+        .unwrap_or_else(|_| Self {
+            provider: "openrouter".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            model_name: "meta-llama/llama-3.1-8b-instruct".into(),
+            vision_model_name: "qwen/qwen-vl-plus".into(),
+            api_key: String::new(),
+            proxy_url: DEFAULT_PROXY_URL.into(),
+            auto_gen_interval_hours: 12,
+            cleanup_interval_hours: 24,
+        })
+    }
+}
+
 /// Our wrapper for the AI engine
 #[derive(Default)]
 pub struct AIEngine {}
@@ -226,19 +264,22 @@ impl AIEngine {
     ) -> Result<ImageAnalysis> {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-        let img = image::ImageReader::open(image_path)?
-            .with_guessed_format()?
-            .decode()
-            .map_err(|e| anyhow::anyhow!("Failed to decode image: {}", e))?;
-        let downscaled = if img.width() > 1024 || img.height() > 1024 {
-            img.resize(1024, 1024, image::imageops::FilterType::Lanczos3)
-        } else {
-            img
-        };
-        let mut buf = Vec::new();
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
-        encoder.encode_image(&downscaled)?;
-        let base64_image = STANDARD.encode(&buf);
+        let img_path = image_path.to_path_buf();
+        let base64_image = tokio::task::spawn_blocking(move || -> Result<String> {
+            let img = image::ImageReader::open(&img_path)?
+                .with_guessed_format()?
+                .decode()
+                .map_err(|e| anyhow::anyhow!("Failed to decode image: {}", e))?;
+            let downscaled = if img.width() > 1024 || img.height() > 1024 {
+                img.resize(1024, 1024, image::imageops::FilterType::Triangle)
+            } else {
+                img
+            };
+            let mut buf = Vec::new();
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
+            encoder.encode_image(&downscaled)?;
+            Ok(STANDARD.encode(&buf))
+        }).await.map_err(|e| anyhow::anyhow!("spawn_blocking failed: {}", e))??;
 
         let prompt = r#"Analyze the provided image and generate:
 - Exactly 5 concise, objective descriptive tags
@@ -373,19 +414,22 @@ Vibe: vibe"#;
     ) -> Result<ImageAnalysis> {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-        let img = image::ImageReader::open(image_path)?
-            .with_guessed_format()?
-            .decode()
-            .map_err(|e| anyhow::anyhow!("Failed to decode image: {}", e))?;
-        let downscaled = if img.width() > 1024 || img.height() > 1024 {
-            img.resize(1024, 1024, image::imageops::FilterType::Lanczos3)
-        } else {
-            img
-        };
-        let mut buf = Vec::new();
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
-        encoder.encode_image(&downscaled)?;
-        let base64_image = STANDARD.encode(&buf);
+        let img_path = image_path.to_path_buf();
+        let base64_image = tokio::task::spawn_blocking(move || -> Result<String> {
+            let img = image::ImageReader::open(&img_path)?
+                .with_guessed_format()?
+                .decode()
+                .map_err(|e| anyhow::anyhow!("Failed to decode image: {}", e))?;
+            let downscaled = if img.width() > 1024 || img.height() > 1024 {
+                img.resize(1024, 1024, image::imageops::FilterType::Triangle)
+            } else {
+                img
+            };
+            let mut buf = Vec::new();
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
+            encoder.encode_image(&downscaled)?;
+            Ok(STANDARD.encode(&buf))
+        }).await.map_err(|e| anyhow::anyhow!("spawn_blocking failed: {}", e))??;
 
         let prompt = r#"Analyze the provided image and generate:
 - Exactly 5 concise, objective descriptive tags
