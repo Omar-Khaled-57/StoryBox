@@ -138,7 +138,7 @@ export default function SettingsPanel({
         </Section>
 
         <Section icon={<BrainIcon />} title="AI Storyteller" description="Configure OpenRouter, Ollama, or Mock mode for story generation.">
-          <AiSettingsSection />
+          <AiSettingsSection setAiHealth={setAiHealth} />
         </Section>
 
         <Section id="ai-health-check" icon={<ShieldIcon />} title="AI Health Check" description="Verify connection to your AI provider.">
@@ -500,7 +500,7 @@ function FolderRow({ folder, isMissing, onToggle, onRemove, onToggleChild }: {
 }
 
 // ── AI Settings (with OpenRouter support) ──
-function AiSettingsSection() {
+function AiSettingsSection({ setAiHealth }: { setAiHealth: (health: AiHealthStatus | null) => void }) {
   const [provider, setProvider] = useState<string>("openrouter");
   const [url, setUrl] = useState("https://openrouter.ai/api/v1");
   const [model, setModel] = useState("meta-llama/llama-3.1-8b-instruct");

@@ -68,6 +68,7 @@ pub async fn scan_persisted_folders(
 }
 
 /// Like scan_persisted_folders but skips paths already scanned (prevents double-counting).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 async fn scan_persisted_folders_except(
     pool: &Pool<Sqlite>,
     tx: &Sender<IndexingJob>,
