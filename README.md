@@ -135,7 +135,7 @@ StoryBox3/
                             │  │  stories / images  │  │
                             │  │  ai_settings       │  │
                             │  └─────────┬──────────┘  │
-                            │            ▼              │
+                            │            ▼             │
                             │  ┌────────────────────┐  │
                             │  │  AI Engine         │  │
                             │  │  ├─ OpenRouter ────┤  │
