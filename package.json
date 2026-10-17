@@ -12,8 +12,8 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-dialog": "^2.6.0",
-    "@tauri-apps/plugin-fs": "^2.4.5",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-fs": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "@gbyte/tauri-plugin-ios-photos": "^0.3.0",
     "@universalappfactory/tauri-plugin-medialibrary": "^0.11.0",
