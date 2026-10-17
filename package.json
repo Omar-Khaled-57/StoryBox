@@ -1,7 +1,7 @@
 {
   "name": "storybox3",
   "private": true,
-  "version": "3.1.0",
+  "version": "3.1.1",
   "author": "Omar Khaled <khaledelkhly57@gmail.com>",
   "type": "module",
   "scripts": {
