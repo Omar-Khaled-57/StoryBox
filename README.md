@@ -19,7 +19,7 @@
 | 🏠 **Fully Local DB** | All your data stays on your device (SQLite) |
 
 <p align="center">
-  <img src="public/storybox3-device-mockup.png" alt="StoryBox3 desktop and mobile story library preview" width="100%">
+  <img src="public/storybox3-device-mockup-docs.webp" alt="StoryBox3 desktop and mobile story library preview" width="100%">
 </p>
 
 ## Visual identity
