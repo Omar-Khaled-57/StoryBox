@@ -18,6 +18,31 @@
 | 🌐 **Cross-Platform** | Windows, macOS, Linux, Android, iOS |
 | 🏠 **Fully Local DB** | All your data stays on your device (SQLite) |
 
+<p align="center">
+  <img src="dev/evice-mockup.png" alt="StoryBox3 desktop and mobile story library preview" width="100%">
+</p>
+
+## Visual identity
+
+StoryBox3 uses a near-black blue canvas, electric blue actions, and violet/cyan
+gradients to make photo stories feel cinematic and AI-assisted.
+
+| Role | Color |
+|---|---|
+| Background | `#05080c` |
+| Primary action | `#0080ff` |
+| Secondary glow | `#8c1aff` |
+| Story gradient | `#0080ff` → `#8c1aff` → `#00c8ff` → `#ff00cc` |
+
+See the [visual identity guide](docs/visual-identity.md) and canonical theme in
+[`src/index.css`](src/index.css).
+
+## Documentation
+
+The full documentation set is indexed in [`docs/README.md`](docs/README.md):
+product, architecture, development, configuration, testing, deployment, and
+changelog. Release notes remain in [`CHANGELOG.md`](CHANGELOG.md).
+
 ---
 
 ## 🚀 Quick Start
@@ -31,7 +56,7 @@
 | **OpenRouter API Key** | AI features | [openrouter.ai/keys](https://openrouter.ai/keys) |
 | **Android Studio** *(optional)* | Android build | [developer.android.com/studio](https://developer.android.com/studio) |
 
-> 💡 You do **not** need Ollama installed. Cloud AI works out of the box via the built-in proxy — no API key required for basic use.
+> 💡 You do **not** need Ollama installed. Cloud AI is routed through the built-in Supabase proxy by default, so no local key is needed — but that proxy must be reachable. See [configuration](docs/configuration.md#ai-provider-settings).
 
 ---
 
@@ -165,7 +190,7 @@ StoryBox3/
 | **Frontend** | React 19, TypeScript, Tailwind CSS v3, Vite |
 | **Backend** | Rust, Tauri 2, SQLite via `sqlx` |
 | **AI** | OpenRouter (proxy or direct), Ollama, Mock |
-| **Mobile** | `tauri-plugin-medialibrary` (Android), `tauri-plugin-ios-photos` (iOS) |
+| **Mobile** | Tauri dialog + fs folder picker (SAF) with base64 image ingestion |
 | **Proxy** | Supabase Edge Function (Deno) |
 
 ---
@@ -174,9 +199,9 @@ StoryBox3/
 
 - **🔑 No hardcoded keys** — Zero API keys are embedded in the source code or binary
 - **🛡️ Proxy mode** — The default Supabase proxy holds the OpenRouter key server-side; your device never sees it
-- **📡 HTTPS only** — All external calls use TLS 1.3
+- **📡 HTTPS only** — Provider calls use HTTPS URLs and `reqwest`'s `rustls-tls` feature; no explicit TLS version is pinned in code
 - **🖼️ Downscaled images** — Photos are resized to 1024px before AI analysis
-- **🗄️ Local-first** — All user data lives in SQLite on your device (`%APPDATA%\com.storybox3.app\` on Windows)
+- **🗄️ Local-first** — All user data lives in `storybox.db` under Tauri's app-local data directory (e.g. `%APPDATA%\com.ok.storybox3\` on Windows)
 - **🚫 No telemetry** — No analytics, tracking, or logging of user data
 
 ---
@@ -188,10 +213,38 @@ StoryBox3/
 | 🪟 Windows | ✅ Full | Pictures, OneDrive, custom folders |
 | 🍎 macOS | ✅ Full | Pictures, Apple Photos library |
 | 🐧 Linux | ✅ Full | Pictures directory |
-| 🤖 Android | ✅ Supported | `tauri-plugin-medialibrary` |
-| 📱 iOS | ⚠️ Beta | `tauri-plugin-ios-photos` (untested) |
+| 🤖 Android | ✅ Supported | Folder picker + base64 ingestion (SAF) |
+| 📱 iOS | ⚠️ Beta | Folder picker + base64 ingestion (untested) |
 
 ---
+
+## 🧰 Commands
+
+Scripts defined in [`package.json`](package.json):
+
+| Script | Command | Purpose |
+| --- | --- | --- |
+| `dev` | `vite` | Start the Vite dev server (fixed port 1420) |
+| `build` | `tsc && vite build` | Type-check and build the frontend into `dist/` |
+| `preview` | `vite preview` | Serve the built frontend locally |
+| `tauri` | `tauri` | Tauri CLI entry point used by the workflows above |
+
+The manifest declares pnpm 11.2.2 and tracks `pnpm-lock.yaml`, while the setup
+steps and `tauri.conf.json` use npm. Pick one package manager consistently.
+
+## ⚠️ Known gaps
+
+- No `test` script or JavaScript test suite; Rust tests in `src-tauri/src/ai.rs`
+  are not wrapped by a manifest command and several need live proxy access.
+- The "Expire After" setting changes the cleanup schedule, but the deletion
+  cutoff is a fixed 24 hours in `stories.rs`.
+- `@gbyte/tauri-plugin-ios-photos` and
+  `@universalappfactory/tauri-plugin-medialibrary` remain in `package.json`
+  even though the Rust plugins were removed; mobile uses dialog + fs instead.
+- No CI/CD or tracked store-signing configuration. `dev/` is gitignored and
+  contains local release artifacts and signing material.
+- See [testing](docs/testing.md) and [configuration](docs/configuration.md)
+  for details.
 
 ## 📄 License
 
