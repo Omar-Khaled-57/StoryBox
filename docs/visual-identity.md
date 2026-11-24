@@ -11,7 +11,7 @@ AI-assisted storytelling identity.
 | Secondary / glow | ![#8c1aff](https://img.shields.io/badge/-%238c1aff?style=flat-square&color=8c1aff) `#8c1aff` |
 | Story gradient | `#0080ff` → `#8c1aff` → `#00c8ff` → `#ff00cc` |
 
-![StoryBox3 desktop and mobile preview](../dev/evice-mockup.png)
+![StoryBox3 desktop and mobile preview](../public/storybox3-device-mockup.png)
 
 Tokens and shared UI styles live in [`src/index.css`](../src/index.css). Feature,
 architecture, and setup details are in [`README.md`](../README.md).
